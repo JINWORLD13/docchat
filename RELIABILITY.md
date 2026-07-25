@@ -248,6 +248,43 @@ MODE=breaker COUNT=9  node scripts/demo-defense.js    # Circuit Breaker + Degrad
 
 ---
 
+## 10. 대안과 트레이드오프 — 왜 이걸 골랐고, 언제 바꾸나
+
+각 레이어는 "이 기술이 정답"이 아니다. 대안이 있고 트레이드오프가 다를 뿐이다.
+선택마다 대안과 "언제 대안으로 갈아탈지"를 정리한다.
+
+| 레이어 | 내 선택 | 대안 | 언제 대안으로 |
+|---|---|---|---|
+| Rate Limiter | Token Bucket 직접 구현 | Sliding Window, Leaky Bucket, rate-limiter-flexible(라이브러리), nginx·API Gateway(인프라) | 버스트를 아예 막아야 하면(결제 API) Leaky Bucket / 백엔드 여러 개면 라이브러리 |
+| Admission Control | 고정 상한 세마포어 | 적응형(Netflix concurrency-limits, TCP 혼잡제어식 AIMD), p-limit/p-queue | 적정 상한을 미리 못 정하겠으면 적응형이 자동 조절 |
+| Bulkhead | 읽기/쓰기 풀 분리 | PgBouncer(외부 풀러), 서비스 물리 분리 | 서버 여러 대면 외부 풀러 / 트래픽 크면 서비스 분리 |
+| Circuit Breaker | 직접 구현 | cockatiel(breaker+retry+timeout+bulkhead 통합, opossum보다 최신), Envoy outlier detection(인프라) | 프로덕션이면 검증된 라이브러리 / 서비스 메시면 인프라 |
+| 임베딩 캐시 | node-cache (TTL) | lru-cache(정교한 LRU 제거), Redis(공유 캐시) | 메모리 압박에 LRU가 필요하면 lru-cache / 서버 여러 대면 Redis |
+| 로그 쓰기 | fire-and-forget | BullMQ + Redis(durable 큐) | 로그 유실이 문제되면 큐 |
+| 벡터 인덱스 | HNSW | IVFFlat(빌드 빠름·메모리 적음·정확도 낮음), 전용 벡터DB(Qdrant 등) | 데이터가 자주 바뀌면 IVFFlat / 수천만 벡터면 전용 DB |
+
+관통하는 축 하나: 앱 코드로 직접 짤 것이냐, 인프라(API Gateway·Service Mesh)에
+맡길 것이냐. 이 문서는 전부 앱 코드 레벨을 택했다. 이유는 명확하다 — 포폴의 목적은
+"내가 이 패턴을 이해하고 있다"를 코드로 증명하는 것이기 때문이다. 실무 대규모
+서비스라면 rate limit이나 circuit breaker 상당수는 Envoy·API Gateway 같은 인프라
+레벨로 올라간다. "왜 인프라 대신 코드로 짰나"라는 질문에는, 지금 스코프에선 이해도
+증명이 목적이었고 확장 시엔 인프라로 옮기는 게 맞다고 판단했다고 답한다.
+
+그래서 최신 라이브러리(cockatiel 등)를 안 쓰고 직접 짠 것도 같은 이유다. 프로덕션이면
+검증된 라이브러리가 맞다. 하지만 직접 짜본 게 "왜 이 임계치인지, 어떤 트레이드오프인지"를
+설명할 수 있게 해준다. 라이브러리를 쓸 거면 "왜 이 라이브러리를 골랐고 임계치를 어떻게
+잡았는지"를 설명하는 게 대신 중요해진다.
+
+두 가지 짚어둘 만한 것:
+- 로그 fire-and-forget의 약점: 응답을 준 뒤 서버가 그 찰나에 죽으면 그 로그는 사라진다.
+  지연 관점에선 완벽하지만 durability는 포기한 선택이다. 로그가 유실되면 안 되는
+  단계가 오면 BullMQ + Redis 큐로 바꿔, 서버가 죽어도 큐에 남아 재시작 후 처리되게 한다.
+- Bulkhead와 PgBouncer: 이 프로젝트의 Neon 연결 주소는 이미 pooler(-pooler)를 거친다.
+  즉 앱 레벨의 읽기/쓰기 풀 분리 위에, 인프라 레벨의 외부 커넥션 풀러가 이미 한 겹 더
+  깔려 있는 셈이다. 서버가 여러 대로 늘어도 총 커넥션 수가 통제되는 구조다.
+
+---
+
 ## 무엇을 했고 → 어떤 결과가 나왔나 (한 줄 요약)
 
 | 결정 | 결과 |
