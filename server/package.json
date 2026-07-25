@@ -1,0 +1,27 @@
+{
+  "name": "docchat-server",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "node --watch index.js",
+    "start": "node index.js",
+    "start:mock": "LLM_PROVIDER=mock node index.js",
+    "start:demo": "LLM_PROVIDER=mock SIMILARITY_THRESHOLD=-1 BREAKER_COOLDOWN_MS=30000 node index.js",
+    "test": "node --test",
+    "bench:cache": "node scripts/bench-cache.js",
+    "loadtest": "node scripts/load-chat.js"
+  },
+  "dependencies": {
+    "@google/genai": "^1.9.0",
+    "cors": "^2.8.5",
+    "dotenv": "^16.4.5",
+    "express": "^5.1.0",
+    "multer": "^2.0.1",
+    "node-cache": "^5.1.2",
+    "pg": "^8.13.1"
+  },
+  "devDependencies": {
+    "autocannon": "^8.0.0"
+  }
+}
