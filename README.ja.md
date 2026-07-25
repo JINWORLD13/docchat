@@ -3,11 +3,17 @@
 # DocChat
 
 ドキュメント(txt, md)をアップロードすると、その内容だけを根拠に回答するRAGチャットボッ
-トです。 React、Express、PostgreSQL(pgvector)、Gemini APIで作りました。
+トです。 ここに、複数人が同じルームで会話するリアルタイムチャットも組み込みました。
+TypeScript、React、Express、PostgreSQL(pgvector)、Socket.IO、Gemini APIで作りました。
+
+ひとつのサーバーが2種類のリアルタイムを扱います — 回答トークンはSSE(一方向)、
+チャットはWebSocket(双方向1:N)。なぜ分けずに同じプロセスに置いたのかは
+[STUDY-REALTIME.md](STUDY-REALTIME.md)(韓国語)にまとめています。
 
 > あわせて読む — [PORTFOLIO.ja.md](PORTFOLIO.ja.md): 技術選定とその理由 ·
 > [RELIABILITY.ja.md](RELIABILITY.ja.md): 負荷・障害対応の設計と測定値 ·
-> [STUDY.md](STUDY.md)(韓国語): フローごとの詳細な解説
+> [STUDY.md](STUDY.md)(韓国語): ドキュメントQ&Aのフロー詳細 ·
+> [STUDY-REALTIME.md](STUDY-REALTIME.md)(韓国語): リアルタイムチャットのフロー詳細
 
 ![回答と根拠の出典](docs/demo-answer.png)
 
@@ -88,10 +94,67 @@ Rate Limiter(Token Bucket)、Admission Control(同時実行の上限 + 待機デ
 Bulkhead(読み取りプール/書き込みプールの分離)、Circuit Breaker、Graceful Degradationを
 自前で実装しました。ボトルネックは推測せず、実際に負荷をかけて測定し(LLMではなくDBプー
 ルでした)、各レイヤーの挙動を単体テストで固定しました。(`cd server && npm test` —
-19件)
+48件)
 
 設計の根拠・代替案の比較・測定値は [RELIABILITY.ja.md](RELIABILITY.ja.md) にまとめてい
 ます。
+
+### リアルタイムチャット
+
+ニックネームを決めるとロビーに入り、左のルーム一覧から選ぶか、新しく作って入室します。
+ルーム一覧は人数とともにリアルタイムで更新され、ルーム内では接続者一覧、入力中の表示、
+入退室の通知、再入室時の直近50件の履歴まで動作します。
+
+ルームの「作成」と「入室」を分けていません — 存在しない名前で入ればその場で作られ、
+最後の一人が退室して会話の記録も無ければ一覧から消えます。空のルームを残しておくと、
+一度使った名前が延々と溜まっていきます。片づける人がいない構成なので、
+自動で整理される側を選びました。
+
+ドキュメントQ&Aと同じサーバー・同じポート(4000)を使います。分けなかったのは、
+転送方式が違うだけで、運用するプロセスを増やす理由にはならないからです。
+統合してみると、むしろ重複が見つかりました — HTTPリクエスト制限とチャットの連投制限が
+同じToken Bucketをそれぞれコピーして持っていたので、`server/tokenbucket.ts` ひとつに
+切り出して両方で共有するようにしました(値だけ用途ごとに変えています)。
+ダッシュボードにも、チャットのルーム数・接続者数と連投で弾かれたメッセージ数が
+一緒に表示されます。
+
+### 画像の送信
+
+ファイル選択、貼り付け(スクリーンショット)、ドラッグ&ドロップの3通りで画像を送れます。
+画像はPostgresに `bytea` として保存します。
+
+**バイト列はソケットに載せません。** 先にHTTPでアップロードし、ソケットにはidだけを
+送ります。ソケットに載せると、写真1枚がルームの人数分だけ複製されて流れ、
+メモリに持っている直近50件の履歴にも画像がそのまま溜まります。
+
+**アドレスはサーバーが作ります。** アップロードはURLではなくidだけを返します。
+クライアントがURLを決められると、`https://evil.example.com/tracker.gif` のような
+アドレスをルーム全体に撒いて、そこにいる人のブラウザに他人のサーバーへ
+リクエストを送らせることができてしまいます。サーバーは受け取ったidが自分の発行した
+ものかを確認してから、はじめてアドレスを付けます。
+
+**形式は先頭バイトで判別します。** ファイル名もContent-Typeもクライアントが書いて
+寄こす値なので信用しません。png/jpg/gif/webpの固定シグネチャを自分で確認し、
+**SVGは意図的に外しました** — SVGはXMLなので `<script>` を含められ、同一オリジンから
+配信した瞬間に保存型XSSになります。レスポンスには `X-Content-Type-Options: nosniff`
+も一緒に付けます。
+
+**取得は別のコネクションプールに分離しました。** 画像の取得はメッセージが表示される
+たびに走る頻繁で重い読み取りなので、質問検索用の読み取りプールに載せると、
+写真の多いルームひとつがこのプロジェクトの「死守する」と言った経路を飢えさせます。
+idがuuidで内容が変わらないため不変キャッシュヘッダを付けており、
+DBまで届くのは各画像の初回リクエストだけです。
+
+### イベント契約を型で固定する
+
+HTTPはパスを間違えれば404がすぐ返りますが、ソケットイベントは名前が文字列なので、
+`"typing"` を `"typeing"` と書いても何も起きません — エラーすら出ません。
+そこでSocket.IOをジェネリクスで包み、`emit`/`on` の名前とpayloadをコンパイル時に
+検査させました。SSEイベントも同じ理由でユニオン型に固定しているので、サーバー側で
+イベントを追加したときにフロント側の処理漏れが型検査で見つかります。
+
+サーバーはビルド工程を持たず、Nodeが型だけ剥がして実行します(`node index.ts`)。
+`tsc` は検査専用として使います(`npm run typecheck`)。
 
 ### ストリーミングと一時的なエラーへの対応
 
@@ -103,8 +166,9 @@ Bulkhead(読み取りプール/書き込みプールの分離)、Circuit Breaker
 
 ## 技術スタック
 
+- 言語: TypeScript (サーバー・フロントエンドとも)
 - フロントエンド: React (Vite)
-- バックエンド: Node.js + Express
+- バックエンド: Node.js + Express + Socket.IO
 - DB: PostgreSQL + pgvector
 - AI: Gemini API — `gemini-embedding-001`(埋め込み) + `gemini-3.6-flash`(生成)、
   無料枠で動作
@@ -141,6 +205,11 @@ npm run dev   # http://localhost:5173
 - 「返品の送料は誰が負担する?」(반품 배송비는 누가 부담해?) → 条件ごとに分けて回答
 - 「フランスの首都は?」(프랑스의 수도는?) → 拒否(ドキュメントにない内容)
 
+リアルタイムチャットは上部の「실시간 채팅(リアルタイムチャット)」タブで確認します。
+ブラウザのタブを2つ開き、同じルーム名で入室すると会話が行き来します。
+テキストの会話はDBがなくても動きますが、画像の送信には `chat_images` テーブルが
+必要です(schema.sqlに含まれています)。
+
 DBスキーマが適用されていない場合(ボリュームを先に作ってしまった場合):
 
 ```bash
@@ -151,28 +220,49 @@ docker exec -i docchat-db psql -U postgres -d docchat < server/schema.sql
 
 ```
 server/
-  index.js            Expressアプリ, /api/metrics, エラーミドルウェア
-  db.js               pgコネクションプール — 読み取り/書き込み分離 (Bulkhead)
-  gemini.js           埋め込み / ストリーミング生成 / 指数バックオフのリトライ
-  chunk.js            オーバーラップするチャンキング
-  cache.js            質問埋め込みキャッシュ (TTL)
-  ratelimit.js        ユーザー別 Token Bucket リクエスト制限
-  admission.js        同時実行の上限 + 待機デッドライン (load shedding)
-  breaker.js          LLMサーキットブレーカー
-  admin.js            障害注入エンドポイントの保護 (トークン / ループバック)
-  faults.js           ランタイム障害注入スイッチ (デモ用)
+  index.ts            Expressアプリ + Socket.IO装着, /api/metrics, エラーミドルウェア
+  types.ts            SSEイベントのユニオン, /api/metrics のレスポンス型 (一元管理)
+  db.ts               pgコネクションプール — 読み取り/書き込み分離 (Bulkhead)
+  gemini.ts           埋め込み / ストリーミング生成 / 指数バックオフのリトライ
+  chunk.ts            オーバーラップするチャンキング
+  cache.ts            質問埋め込みキャッシュ (TTL)
+  imagetype.ts        アップロードされたバイト列の先頭で形式を判別 (SVGは除外)
+  images.ts           チャット画像の保存/取得 (DBを知るコードをここに閉じ込める)
+  tokenbucket.ts      Token Bucketアルゴリズム — HTTP·ソケット制限で共有
+  ratelimit.ts        ユーザー(IP)別 HTTPリクエスト制限
+  admission.ts        同時実行の上限 + 待機デッドライン (load shedding)
+  breaker.ts          LLMサーキットブレーカー
+  admin.ts            障害注入エンドポイントの保護 (トークン / ループバック)
+  faults.ts           ランタイム障害注入スイッチ (デモ用)
   routes/
-    documents.js      アップロード, 一覧, 原文閲覧(GET), 編集(PUT), 削除
-    chat.js           検索 → 拒否ゲート → 回路確認 → SSEストリーミング → ロギング
+    documents.ts      アップロード, 一覧, 原文閲覧(GET), 編集(PUT), 削除
+    chat.ts           検索 → 拒否ゲート → 回路確認 → SSEストリーミング → ロギング
+    images.ts         チャット画像のアップロード(POST) / 取得(GET, 不変キャッシュ)
+  realtime/
+    types.ts          ソケットイベント契約 (webと対)
+    gateway.ts        接続·入室·ブロードキャスト·退室のハンドラ
+    rooms.ts          ルーム状態 (直近50件 + 接続者) のメモリ保持
+    ratelimit.ts      ソケット別の連投制限
   scripts/            負荷テスト, キャッシュベンチ, 防御レイヤーのデモ
   schema.sql
-  *.test.js           単体テスト19件 (チャンキング·rate limit·breaker·admission)
+  tsconfig.json       ビルドなし — Nodeが型を剥がして実行, tscは検査のみ
+  *.test.ts           単体テスト48件
+                      (チャンキング·token bucket·rate limit·breaker·admission·rooms)
 web/
   src/
-    api.js            fetch + SSEパース
-    App.jsx
+    types.ts          サーバーと揃えた契約 (ドキュメント·SSEイベント·metrics)
+    api.ts            fetch + SSEパース (イベント別ハンドラのディスパッチ)
+    App.tsx           上部タブ — ドキュメントQ&A / リアルタイムチャット / ダッシュボード
     components/       Sidebar(アップロード/一覧) / Chat / Message(根拠表示)
                       DocModal(閲覧·編集ポップアップ) / Dashboard(負荷·障害ダッシュボード)
+    realtime/
+      types.ts        ソケットイベント契約 (serverと対)
+      socket.ts       型付きソケット (同一オリジンに接続)
+      LiveChat.tsx    ソケット接続の管理 + ニックネーム → ロビー → ルーム遷移
+      Nickname.tsx    ニックネーム入力
+      RoomList.tsx    ルーム一覧 + 新規ルーム作成
+      Room.tsx        購読·送信·接続者一覧
+  vite.config.ts      /api プロキシ + /socket.io プロキシ(ws)
 sample-docs/          デモ用の架空ショッピングモールのドキュメント
 docs/                 README·ポートフォリオ用スクリーンショット
 docker-compose.yml    pgvector入りPostgres
@@ -193,5 +283,15 @@ docker-compose.yml    pgvector入りPostgres
   作って自動で測定するのが次の目標です。
 - クライアントが応答の途中で離脱しても、サーバーはLLMストリームを最後まで消費します。
   接続終了(close)イベントを検知して生成を中断するのが次の改善候補です。
+- チャット履歴がサーバーのメモリにしかないため、再起動すると消えます。段階としては
+  ① 現在: 単一サーバーのインメモリ(ルーム·メッセージ·presence·連投防止) →
+  ② メッセージをPostgresに永続化してdurabilityを確保 → ③ Socket.IOのRedisアダプタで
+  pub/subを追加し、presenceをRedisへ移して、別サーバーに繋いだ利用者にも
+  メッセージが届くようにする、という順序を考えています。
+  埋め込みキャッシュがインメモリなのと同じ性質の限界です。
+- チャットにログインがなく、ニックネームを誰でも使えます。
+- サーバーとフロントがイベント契約の型をそれぞれコピーして持っています。今の規模では
+  ワークスペース導入のコストの方が大きいため見送り、大きくなったら共有パッケージに
+  切り出す予定です。
 - デプロイはNeon(pgvector対応) + Render + Netlifyの無料枠の組み合わせで公開する
   予定です。

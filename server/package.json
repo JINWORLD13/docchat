@@ -4,13 +4,14 @@
   "private": true,
   "type": "module",
   "scripts": {
-    "dev": "node --watch index.js",
-    "start": "node index.js",
-    "start:mock": "LLM_PROVIDER=mock node index.js",
-    "start:demo": "LLM_PROVIDER=mock SIMILARITY_THRESHOLD=-1 BREAKER_COOLDOWN_MS=30000 node index.js",
+    "dev": "node --watch index.ts",
+    "start": "node index.ts",
+    "start:mock": "LLM_PROVIDER=mock node index.ts",
+    "start:demo": "LLM_PROVIDER=mock SIMILARITY_THRESHOLD=-1 BREAKER_COOLDOWN_MS=30000 node index.ts",
+    "typecheck": "tsc --noEmit",
     "test": "node --test",
-    "bench:cache": "node scripts/bench-cache.js",
-    "loadtest": "node scripts/load-chat.js"
+    "bench:cache": "node scripts/bench-cache.ts",
+    "loadtest": "node scripts/load-chat.ts"
   },
   "dependencies": {
     "@google/genai": "^1.9.0",
@@ -19,9 +20,17 @@
     "express": "^5.1.0",
     "multer": "^2.0.1",
     "node-cache": "^5.1.2",
-    "pg": "^8.13.1"
+    "pg": "^8.13.1",
+    "socket.io": "^4.8.3"
   },
   "devDependencies": {
-    "autocannon": "^8.0.0"
+    "@types/autocannon": "^7.12.7",
+    "@types/cors": "^2.8.19",
+    "@types/express": "^5.0.6",
+    "@types/multer": "^2.2.0",
+    "@types/node": "^26.1.1",
+    "@types/pg": "^8.15.6",
+    "autocannon": "^8.0.0",
+    "typescript": "^7.0.2"
   }
 }

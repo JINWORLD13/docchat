@@ -34,7 +34,7 @@
   │
   ▼ [2] Admission Control (전체)  동시 처리량 상한. 넘치면 무한 대기 대신 즉시 429
   │
-  ▼ [3] Bulkhead (자원 격리)      읽기 풀/쓰기 풀 분리. 쓰기 폭주가 질문을 막지 않게
+  ▼ [3] Bulkhead (자원 격리)      읽기·쓰기·미디어 풀 분리. 쓰기·이미지 폭주가 질문을 막지 않게
   │
   ▼ [4] 검색 + 거절 게이트        관련 없으면 LLM 안 부름 (부하 감소 + 헛소리 방지)
   │
@@ -46,11 +46,15 @@
 앞 3개는 예방(무너지지 않게), 뒤 2개는 저하 대응(넘쳐도 죽지 않게)이다.
 이 레이어들이 실시간으로 반응하는 걸 대시보드에서 버튼으로 주입해 볼 수 있다(9번).
 
+이 순서는 HTTP 질문 경로다. 실시간 채팅 메시지는 [1]과 같은 알고리즘을 값만 달리해
+통과하고(2번), 나머지 레이어는 거치지 않는다 — LLM도 DB도 쓰지 않기 때문이다.
+
 ---
 
 ## 2. Rate Limiter — 한 명의 폭주 차단 (Token Bucket, 직접 구현)
 
-파일: server/ratelimit.js
+파일: server/tokenbucket.ts(알고리즘), server/ratelimit.ts(HTTP),
+server/realtime/ratelimit.ts(채팅 도배)
 
 무엇을 고민했나 (P)
 악의적 사용자나 버그난 클라이언트 하나가 초당 수백 건을 쏘면 서버 전체가 마비된다.
@@ -65,15 +69,45 @@
 Token Bucket을 직접 구현했다. 라이브러리를 쓰는 대신 직접 짠 이유는, 이 알고리즘을
 이해하고 있다는 걸 코드로 보여줄 수 있는 가장 확실한 증거이기 때문이다.
 
+여기에 나중에 하나가 붙었다. 실시간 채팅을 같은 서버에 합치면서, 소켓별 도배 제한이
+HTTP 요청 제한과 똑같은 Token Bucket을 각자 복사해 갖고 있는 게 드러났다. 알고리즘을
+server/tokenbucket.ts로 빼내 `TokenBuckets` 클래스 하나를 양쪽이 공유하게 했다.
+중복이 사라진 것보다 중요한 건, 두 경로에서 무엇이 같아야 하고 무엇이 달라야 하는지가
+이때 갈렸다는 것이다.
+
+| | HTTP 질문 (ratelimit.ts) | 채팅 메시지 (realtime/ratelimit.ts) |
+|---|---|---|
+| 용량 (순간 버스트) | 10 | 5 |
+| 초당 충전 | 5 | 2 |
+| 버킷 회수 | sweep — 유휴 10분이 지나면 청소 | drop — disconnect 시점에 즉시 |
+
+값이 다른 이유: HTTP 질문은 한 건이 비싸고(임베딩 + LLM 왕복) 드물게 온다. 채팅
+메시지는 싸고 자주 온다. 그런데도 채팅 쪽 버스트를 더 좁게 잡았다. 한 명의 도배는
+본인만 느려지고 끝나는 게 아니라 같은 방 사람들 화면을 전부 덮어버리기 때문이다.
+한도를 요청이 서버에 얼마나 비싼가가 아니라, 넘쳤을 때 피해가 어디까지 번지는가로
+정한 셈이다.
+
+회수 방식이 다른 이유: 소켓에는 disconnect라는 "이제 안 온다"는 신호가 있다. 그 시점에
+`drop()`으로 정확히 지우면 된다. IP에는 그 신호가 없다. 언제 다시 올지 모르니 지울
+시점을 알 수 없고, 그렇다고 안 지우면 버킷 Map이 무한히 자란다. 그래서 IP 쪽만
+주기적으로 유휴 버킷을 `sweep(idleMs)`으로 훑어 낸다. 같은 메모리 누수 문제라도
+생명주기를 알려주는 신호가 있느냐에 따라 답이 달라진다.
+
+API도 한 가지 못박았다. `take()`는 boolean이 아니라
+`{ ok: true } | { ok: false; retryAfterSec: number }`를 돌려준다. "대기 시간은 거절일
+때만 존재한다"를 타입으로 쓴 것이라, 통과한 경우에 `retryAfterSec`을 읽으려 하면
+컴파일러가 막는다. Retry-After 헤더를 빈 값으로 채우는 실수가 애초에 안 난다.
+
 결과 (R)
 용량 10, 초당 5 충전으로 두고 한 IP에서 동시 15발을 쐈다.
 - 통과 10, 거절(429) 5. 딱 버킷 용량만큼 통과하고 나머지는 429로 막혔다.
+채팅 쪽에서 도배로 막힌 메시지는 /api/metrics의 `realtime.messagesRejected`로 따로 센다.
 
 ---
 
 ## 3. Admission Control — 무한 대기 대신 빠른 거절
 
-파일: server/admission.js
+파일: server/admission.ts
 
 무엇을 고민했나 (P)
 0단계 측정에서 봤듯이, 동시 요청이 몰리면 풀 대기열이 무한정 쌓인다. 이대로 두면
@@ -112,7 +146,7 @@ Token Bucket을 직접 구현했다. 라이브러리를 쓰는 대신 직접 짠
 
 ## 3-2. Bulkhead — 자원 풀 격리
 
-파일: server/db.js
+파일: server/db.ts
 
 무엇을 고민했나 (P)
 커넥션 풀 하나를 모두가 공유하면, 한 종류의 작업이 커넥션을 다 먹었을 때 다른 작업까지
@@ -124,15 +158,27 @@ Token Bucket을 직접 구현했다. 라이브러리를 쓰는 대신 직접 짠
 쓰기용 writePool을 별도로 둔다. 쓰기가 폭주해 writePool이 포화돼도 readPool은 멀쩡해
 질문 응답은 계속된다.
 
+채팅에 이미지를 붙이면서 풀이 하나 더 늘었다(mediaPool). 이미지 조회는 "읽기"지만
+readPool에 태우지 않았다. 성격이 전혀 다르기 때문이다 — 질문 검색은 사용자가 한 번
+누를 때 한 번 나가지만, 이미지 조회는 메시지가 화면에 뜰 때마다 나가고 한 건이
+수백 KB다. 사진을 많이 올린 방 하나가 readPool을 다 먹으면, 이 문서가 첫 줄부터
+"사수 대상"이라고 부른 경로가 그 옆에서 굶는다. 지키겠다고 선언한 자원 옆에
+성격이 다른 트래픽을 붙이는 건 격벽을 세워놓고 문을 열어두는 것과 같다.
+
+mediaPool의 max를 4로 작게 잡은 건 부족해서가 아니라 상한을 못박기 위해서다.
+이미지는 id가 uuid고 내용이 안 바뀌어서 불변 캐시 헤더를 줄 수 있고, 그러면 DB까지
+오는 건 각 이미지의 첫 요청뿐이다. 정상 상태에서 이 풀은 거의 비어 있고, 폭주할 때만
+4에서 막힌다.
+
 결과 (R)
-/api/metrics에서 두 풀의 대기 수(waiting)를 따로 노출한다. 대시보드에서 쓰기 폭주 시
+/api/metrics에서 세 풀의 대기 수(waiting)를 따로 노출한다. 대시보드에서 쓰기 폭주 시
 writePool만 대기가 쌓이고 readPool은 0으로 유지되는 걸 눈으로 확인할 수 있다.
 
 ---
 
 ## 4. Circuit Breaker — 죽은 의존성을 계속 두드리지 않는다
 
-파일: server/breaker.js
+파일: server/breaker.ts
 
 무엇을 고민했나 (P)
 외부 LLM이 장애가 나면 재시도까지 겹쳐 요청마다 몇 초씩 매달렸다 실패한다. 그 사이
@@ -158,7 +204,7 @@ writePool만 대기가 쌓이고 readPool은 0으로 유지되는 걸 눈으로 
 
 ## 5. Graceful Degradation — 빈손으로 돌려보내지 않는다
 
-파일: server/routes/chat.js (degrade)
+파일: server/routes/chat.ts (degrade)
 
 무엇을 고민했나 (P)
 LLM이 죽었다고 사용자에게 "오류"만 던지면, 사용자는 아무것도 못 얻는다. 한 번의
@@ -179,20 +225,20 @@ LLM이 완전히 죽은 상황에서도 사용자는 항상 관련 문서를 받
 
 ## 6. 예방 쪽 최적화 (질문 경로)
 
-### 임베딩 캐시 (server/cache.js)
+### 임베딩 캐시 (server/cache.ts)
 P: 같은 질문이 반복될 때마다 임베딩 API를 다시 부르면 매번 네트워크 왕복 + rate limit 압박.
 A: 질문 임베딩을 캐싱. 지금은 인메모리(node-cache), 서버가 여러 대가 되면 Redis로 교체
    (부르는 쪽 코드는 안 바뀌게 get/set/stats만 노출).
 R: 실제 Gemini로 측정 — 캐시 미스 1197 ms, 캐시 히트 0.05 ms. 반복 질문에서 질문당
    약 1.2초를 없앤다.
 
-### 로그 쓰기를 응답 경로에서 분리 (server/routes/chat.js)
+### 로그 쓰기를 응답 경로에서 분리 (server/routes/chat.ts)
 P: 질문마다 관측 로그를 DB에 쓰는데, 이걸 기다리느라 사용자 응답이 늦어졌다.
 A: 로그는 사용자가 답을 다 받은 뒤 백그라운드로 쓴다(fire-and-forget). 관측 데이터
    저장을 사용자 지연 경로에서 뺐다. 쓰기와 읽기 경로를 분리한 셈(bulkhead 발상).
 R: 동시 20 연결 — 처리량 20→24 RPS, 지연 p99 2794→1606 ms (42% 감소).
 
-### 커넥션 풀 튜닝 + 타임아웃 (server/db.js)
+### 커넥션 풀 튜닝 + 타임아웃 (server/db.ts)
 연결 상한(max), 유휴 반납(idleTimeout), 연결 획득 타임아웃(5초)을 명시했다.
 타임아웃이 없으면 부하 때 요청이 무한 대기로 쌓인다. 5초 안에 연결 못 얻으면 실패시켜
 빠르게 흘려보낸다.
@@ -206,9 +252,13 @@ R: 동시 20 연결 — 처리량 20→24 RPS, 지연 p99 2794→1606 ms (42% �
 
 모니터링이 곧 결정력이다. 어느 레이어가 언제 발동했는지 봐야 장애 상황에서 몇 초 안에
 원인을 잡는다. GET /api/metrics 로 캐시 적중률, 풀 상태, rate limit 거절 수, 동시
-처리 수, 회로 상태를 한 번에 노출한다. (프로덕션은 Prometheus + Grafana)
+처리 수, 회로 상태, 그리고 실시간 채팅 쪽(`realtime` — 방 수, 접속자 수, 도배로 막힌
+메시지 수)을 한 번에 노출한다. (프로덕션은 Prometheus + Grafana)
 
 ```bash
+# 방어 레이어 단위 테스트 (48개)
+npm test
+
 # 캐시 효과 (실제 Gemini)
 npm run bench:cache
 
@@ -217,12 +267,44 @@ npm run start:mock            # 다른 터미널에서
 CONN=50 DUR=10 npm run loadtest
 
 # 방어 레이어 시연
-MODE=burst   COUNT=15 node scripts/demo-defense.js   # Rate Limiter
+MODE=burst   COUNT=15 node scripts/demo-defense.ts   # Rate Limiter
 LLM_FAIL=1 npm run start:mock                          # 장애 주입 서버
-MODE=breaker COUNT=9  node scripts/demo-defense.js    # Circuit Breaker + Degradation
+MODE=breaker COUNT=9  node scripts/demo-defense.ts    # Circuit Breaker + Degradation
 ```
 
 부하 도구는 autocannon(Node), 프로덕션급 시나리오는 k6나 Artillery로 확장 가능.
+서버는 빌드 단계가 없다. Node가 타입만 벗겨 `node index.ts`로 그대로 실행하고, `tsc`는
+검사기(`npm run typecheck`)로만 쓴다. 위 명령이 가리키는 경로가 곧 소스 경로다.
+
+### 측정 말고 테스트로 고정한 것 (48개)
+
+측정은 "지금 이 값이 나왔다"를 보여줄 뿐, 다음 커밋에서도 그 동작이 그대로인지는
+보장하지 않는다. 그래서 각 레이어가 언제 발동해야 하는지는 단위 테스트로 못박아 뒀다.
+
+| 파일 | 무엇을 고정하나 |
+|---|---|
+| tokenbucket.test.ts | 알고리즘 자체 — 버스트 허용, 토큰 충전, 키별 격리, drop/sweep 회수 |
+| ratelimit.test.ts | 그 알고리즘을 HTTP에 제대로 붙였는가 — 429, Retry-After 헤더, IP를 키로 |
+| admission.test.ts | 동시 상한, 큐 초과 시 즉시 거절, 대기 데드라인 |
+| breaker.test.ts | 임계치에서 회로 열림, 쿨다운 뒤 복구 |
+| chunk.test.ts | 문서 분할 |
+| realtime/rooms.test.ts | 유령 사용자 방지, 빈 방 정리, 히스토리 50개 상한, 방 격리 |
+| imagetype.test.ts | 업로드 형식 판별 — 위장한 SVG·HTML 거절, 잘린 파일에서 안 터짐 |
+
+imagetype.test.ts는 "받아야 할 걸 받는가"보다 "거절해야 할 걸 거절하는가"를 더 많이
+본다. 여기서 통과시키면 안 되는 걸 통과시키는 게 이 프로젝트에서 가장 비싼 실수이기
+때문이다 — 사용자가 올린 바이트를 나중에 같은 오리진에서 브라우저로 내려보낸다.
+
+알고리즘을 뽑아내면서 테스트도 둘로 갈렸다. 알고리즘이 맞는가와, 그걸 HTTP에 제대로
+붙였는가는 다른 질문이라 다른 파일에서 검증한다.
+
+여기서 하나 신경 쓴 게 있다. Token Bucket 테스트는 "1초 뒤에 토큰이 충전됐는가"를
+확인해야 하는데, 실제로 1초를 기다리면 테스트가 느려지고 CI에서 타이밍이 빠듯할 때
+간헐적으로 깨진다. 그래서 `take(key, now)`처럼 시각을 인자로 받게 만들었다. 테스트는
+시각을 원하는 만큼 앞으로 밀어 놓고 결과를 본다 — 기다리지 않고, 매번 같은 결과가
+나온다. `sweep(idleMs, now)`도 같은 이유로 시각을 받는다. 10분 유휴 회수가 맞는지
+확인하려고 10분을 기다릴 수는 없다. 시간에 의존하는 로직은 시간을 주입받게 만들어야
+결정적으로 테스트된다.
 
 ---
 
@@ -230,26 +312,32 @@ MODE=breaker COUNT=9  node scripts/demo-defense.js    # Circuit Breaker + Degrad
 
 경력 0에서 전부 실제 인프라로 구현하는 건 과하다. 무엇을 왜 뺐는지 아는 것이 더 중요하다.
 
-- Bulkhead: 읽기 풀 / 쓰기 풀로 실제 분리 구현(db.js). 기능별로 더 잘게 나누는 건
+- Bulkhead: 읽기 / 쓰기 / 미디어 풀로 실제 분리 구현(db.ts). 기능별로 더 잘게 나누는 건
   서버 규모가 커질 때.
 - 오토스케일링: 새 서버 뜨는 데 수십 초 걸려 급스파이크는 못 따라간다. 예측 가능한
   대량 트래픽은 미리 스케일업하는 결정이 필요 — 인프라 영역이라 설계로만.
 - Redis(공유 캐시 + Bull 큐): 서버가 여러 대가 되면 인메모리 캐시·큐는 인스턴스마다
   따로 놀아 한계가 있다. 그때 Redis로 간다. (참고한 Cosmos Tarot 프로젝트가 이 구성)
 - Prometheus + Grafana: 지금은 /api/metrics(JSON)로 충분. 대시보드는 운영 단계.
-- Pub/Sub · Presence(접속 상태) · 메시지 유실 방지: 이건 카톡·슬랙 같은 실시간
-  다중 사용자 메시징 시스템의 관심사다. DocChat은 문서 Q&A라 해당 없다.
+- Pub/Sub · 메시지 유실 방지: 원래는 "DocChat은 문서 Q&A라 해당 없다"고 적어둔
+  항목인데, 실시간 채팅이 붙으면서 셋 중 Presence(접속자 목록)는 실제로 구현됐다.
+  나머지 둘은 여전히 안 했다. 방 상태는 서버 메모리에 있고 방마다 최근 50개만
+  보관한다. 사람이 다 나가고 기록도 없으면 방 자체를 지워 메모리 누수를 막는다.
+  서버가 여러 대로 늘면 방 상태를 Redis로 옮겨야 하는데(그때 Pub/Sub이 필요해진다),
+  임베딩 캐시(cache.ts)가 인메모리인 것과 정확히 같은 성격의 한계다 — 서버 한 대를
+  전제로 한 선택이라는 뜻이다.
   다만 그 밑의 원리("잃으면 안 되는 건 영구 저장소에, 빠른 건 임시 저장소에")는
   이미 지켰다 — 문서·청크는 Postgres에 트랜잭션으로 durable 저장하고, 잃어도 되는
-  임베딩 캐시만 인메모리에 둔다(날아가도 재생성=cache miss일 뿐). 그래서 나중에
-  Redis를 쓰더라도 그건 캐시나 로그 큐지, 데이터 본체가 아니다. 남의 아키텍처
-  조언을 시스템 종류에 맞게 걸러내는 것도 설계 판단이다.
+  임베딩 캐시와 채팅 기록만 인메모리에 둔다(날아가도 재생성=cache miss이거나 최근
+  대화가 사라질 뿐이다). 그래서 나중에 Redis를 쓰더라도 그건 캐시·방 상태·로그 큐지,
+  데이터 본체가 아니다. 남의 아키텍처 조언을 시스템 종류에 맞게 걸러내는 것도
+  설계 판단이다.
 
 ---
 
 ## 9. 실시간 대시보드 — 상황을 주입하고 반응을 관찰한다
 
-파일: web/src/components/Dashboard.jsx, server/index.js(관리자 엔드포인트)
+파일: web/src/components/Dashboard.tsx, server/index.ts(관리자 엔드포인트)
 
 프론트에 대시보드 탭을 뒀다. /api/metrics를 1초마다 폴링해 방어 레이어 4개와 지표를
 실시간으로 그린다. 버튼으로 상황을 주입한다.
@@ -258,6 +346,10 @@ MODE=breaker COUNT=9  node scripts/demo-defense.js    # Circuit Breaker + Degrad
 - "LLM 장애 ON": 생성을 실패시킨다 → 요청이 degraded(출처만)로 응답하고, 연속 실패가
   임계치를 넘으면 Circuit Breaker가 빨간색으로 열린다(재시도 카운트다운 표시).
 - "리셋": 장애 해제 + 회로 초기화.
+
+Rate Limiter 칸은 HTTP 거절과 채팅 도배 차단을 함께 보여준다("사용자별 요청 제한
+(HTTP · 소켓 공용)"). 두 경로가 같은 알고리즘을 공유하니 대시보드에서도 한 칸으로
+묶었다. 어느 쪽에서 막혔는지는 숫자를 나눠 적는다.
 
 왜 넣었나: 모니터링이 곧 결정력이다. 방어 로직이 "언제 발동했는지" 눈으로 볼 수 없으면,
 실제 장애 상황에서 뭐가 문제인지 몇 초 안에 판단할 수 없다. 이 대시보드는 그 판단을
@@ -268,7 +360,7 @@ MODE=breaker COUNT=9  node scripts/demo-defense.js    # Circuit Breaker + Degrad
 이 화면이 포폴에서 "과부하·장애 시 시스템이 어떻게 버티는가"를 말이 아니라 움직이는
 그림으로 보여주는 부분이다.
 
-### 데모 기능이 프로덕션의 구멍이 되지 않게 (server/admin.js)
+### 데모 기능이 프로덕션의 구멍이 되지 않게 (server/admin.ts)
 
 장애 주입 엔드포인트(`/api/admin/fault`)는 서비스를 고의로 망가뜨리는 스위치다.
 데모에는 필요하지만, 배포된 서버에 그대로 열려 있으면 누구나 서비스를 내릴 수 있다.
@@ -290,7 +382,7 @@ MODE=breaker COUNT=9  node scripts/demo-defense.js    # Circuit Breaker + Degrad
 클라이언트가 `X-Forwarded-For`를 직접 넣어 `req.ip`를 요청마다 다른 값으로 조작할
 수 있고, IP별로 버킷을 나누는 Rate Limiter(2번)가 "매번 새 사용자"로 인식해 통째로
 우회된다. 그래서 `trust proxy`는 `1`(우리 인프라의 LB 한 홉만 신뢰)로 못박았다
-(server/index.js). 스푸핑 가능한 값 문제는 인증만이 아니라 방어 레이어 전체의 문제다.
+(server/index.ts). 스푸핑 가능한 값 문제는 인증만이 아니라 방어 레이어 전체의 문제다.
 
 한계도 적어둔다: 배포 환경에서 대시보드 버튼이 동작하려면 토큰을 프론트 빌드
 (`VITE_ADMIN_TOKEN`)에 넣어야 하는데, 빌드에 들어간 값은 방문자 누구나 번들에서
@@ -310,7 +402,7 @@ MODE=breaker COUNT=9  node scripts/demo-defense.js    # Circuit Breaker + Degrad
 |---|---|---|---|
 | Rate Limiter | Token Bucket 직접 구현 | Sliding Window, Leaky Bucket, rate-limiter-flexible(라이브러리), nginx·API Gateway(인프라) | 버스트를 아예 막아야 하면(결제 API) Leaky Bucket / 백엔드 여러 개면 라이브러리 |
 | Admission Control | 고정 상한 세마포어 | 적응형(Netflix concurrency-limits, TCP 혼잡제어식 AIMD), p-limit/p-queue | 적정 상한을 미리 못 정하겠으면 적응형이 자동 조절 |
-| Bulkhead | 읽기/쓰기 풀 분리 | PgBouncer(외부 풀러), 서비스 물리 분리 | 서버 여러 대면 외부 풀러 / 트래픽 크면 서비스 분리 |
+| Bulkhead | 읽기·쓰기·미디어 풀 분리 | PgBouncer(외부 풀러), 서비스 물리 분리 | 서버 여러 대면 외부 풀러 / 트래픽 크면 서비스 분리 |
 | Circuit Breaker | 직접 구현 | cockatiel(breaker+retry+timeout+bulkhead 통합, opossum보다 최신), Envoy outlier detection(인프라) | 프로덕션이면 검증된 라이브러리 / 서비스 메시면 인프라 |
 | 임베딩 캐시 | node-cache (TTL) | lru-cache(정교한 LRU 제거), Redis(공유 캐시) | 메모리 압박에 LRU가 필요하면 lru-cache / 서버 여러 대면 Redis |
 | 로그 쓰기 | fire-and-forget | BullMQ + Redis(durable 큐) | 로그 유실이 문제되면 큐 |
@@ -344,10 +436,12 @@ MODE=breaker COUNT=9  node scripts/demo-defense.js    # Circuit Breaker + Degrad
 |---|---|
 | 병목을 추측 말고 측정 | 병목이 LLM이 아니라 DB 풀임을 확인 (대기열 88) |
 | Token Bucket rate limit 직접 구현 | 한 IP 15발 → 10 통과, 5 거절 |
+| Token Bucket을 공용 모듈로 추출 | HTTP·채팅이 같은 알고리즘, 값과 회수 방식만 분리 |
 | 무한 큐 대신 admission control | 대기열 88 → 6, 초과분 즉시 429 |
 | 큐 길이뿐 아니라 대기 시간에도 상한 | 데드라인 초과 시 포기, 즉시거절/대기포기를 나눠 관측 |
-| 읽기/쓰기 풀 격리 (bulkhead) | 쓰기 폭주가 질문 검색을 막지 않음 |
+| 읽기·쓰기·미디어 풀 격리 (bulkhead) | 쓰기·이미지 폭주가 질문 검색을 막지 않음 |
 | LLM에 circuit breaker | 5회 실패 후 회로 열림, 지연 500→190ms |
 | 실패 시 graceful degradation | LLM 죽어도 출처 반환, 에러율 0 |
 | 질문 임베딩 캐시 | 반복 질문 1197ms → 0.05ms |
 | 로그 쓰기 백그라운드 분리 | p99 2794 → 1606ms (-42%) |
+| 시각을 주입해 테스트 | 기다림 없이 결정적, 레이어 동작을 48개로 고정 |

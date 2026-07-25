@@ -4,9 +4,11 @@
 
 문서를 업로드하면 그 문서 내용만 근거로 답하는 RAG 챗봇.
 문서에 없는 질문은 지어내지 않고 거절하며, 답변마다 근거 출처를 표시한다.
+여러 명이 같은 방에서 대화하는 실시간 채팅을 같은 서버에 함께 얹었다.
 
 - 저장소: https://github.com/JINWORLD13/docchat
-- 스택: React (Vite) · Node/Express · PostgreSQL + pgvector · Gemini API
+- 스택: TypeScript · React (Vite) · Node/Express · PostgreSQL + pgvector ·
+  Socket.IO · Gemini API
 - 로컬 실행: 아래 [실행](#실행) 세 단계
 
 ---
@@ -52,9 +54,11 @@ LLM을 부르지도 않고 degraded(출처만)로 응답한다. **20건 중 하�
 
 ```
   브라우저 (React)
-     │  질문 (POST, SSE로 응답 수신)
+     │  질문 (POST, SSE로 응답 수신) · 채팅 (WebSocket)
      ▼
-  Express 서버
+  Express 서버 + Socket.IO  (한 프로세스 · 같은 포트 4000)
+     │
+     ├─ 채팅: 소켓 → 도배 제한(Token Bucket) → 같은 방에 브로드캐스트
      │
      ├─ 넣기: 파일 → 청킹(겹침) → 임베딩 → 저장
      │                                  │
@@ -72,9 +76,10 @@ LLM을 부르지도 않고 degraded(출처만)로 응답한다. **20건 중 하�
                           Gemini API (생성, 스트리밍)
 ```
 
-핵심은 두 흐름이다. 문서를 넣는 흐름(청킹 → 임베딩 → 저장)과 질문하는 흐름
-(검색 → 거절 판단 → 생성). 생성 호출은 맨 마지막 한 조각일 뿐이고, 그 앞의
-검색과 거절이 이 프로젝트의 본체다.
+문서 Q&A의 핵심은 두 흐름이다. 문서를 넣는 흐름(청킹 → 임베딩 → 저장)과
+질문하는 흐름(검색 → 거절 판단 → 생성). 생성 호출은 맨 마지막 한 조각일 뿐이고,
+그 앞의 검색과 거절이 이 프로젝트의 본체다. 채팅은 전송 방식만 다를 뿐 같은
+프로세스에 얹혀 있고, rate limit 같은 방어 로직을 문서 Q&A와 공유한다.
 
 ---
 
@@ -96,9 +101,39 @@ vector 컬럼 하나를 더하는 것이라, 메타데이터 조인과 벡터 �
 최고 유사도가 임계값 미만이면 LLM을 호출하지 않고 거절한다. 헛소리를 막고
 토큰도 아낀다.
 
-스트리밍은 SSE.
-답변은 서버에서 클라이언트로 흐르는 단방향이라 WebSocket까지 갈 필요가 없다.
-SSE가 HTTP 위에서 그대로 동작해 더 단순하다.
+답변은 SSE, 채팅은 WebSocket.
+한 앱에 "실시간"이 둘인데 성격이 다르다. 답변 토큰은 서버에서 클라이언트로 흐르는
+단방향 1:1이라 SSE로 충분하다 — HTTP 위에서 그대로 동작하니 프록시와 재연결이
+공짜다. 반면 채팅은 양방향이고 한 사람의 발화를 방 전체(1:N)에 밀어줘야 해서
+WebSocket이 맞다. 전송 방식은 취향이 아니라 필요한 방향이 갈랐다.
+
+그래도 서버는 나누지 않았다.
+전송 방식이 다른 것과 프로세스를 나눌 이유가 있는 것은 다른 얘기다. 같은 Express
+HTTP 서버 하나에 Socket.IO를 붙여 포트·배포·CORS를 하나로 유지했고, 방어 로직도
+공유한다. 합치고 나서야 중복이 드러났다 — HTTP 요청 제한과 채팅 도배 제한이 같은
+Token Bucket을 각자 복사해 갖고 있었다. 이걸 server/tokenbucket.ts 하나로 뽑아
+양쪽이 공유하고 값만 다르게 준다(HTTP는 용량 10·초당 5개 충전, 채팅은 5·2).
+회수 방식도 다르다 — 소켓은 disconnect 신호가 있어 `drop()`으로 정확히 회수하고,
+IP는 그런 신호가 없어 주기적 `sweep()`으로 유휴 버킷을 청소한다. 나눠야 할 때는
+두 트래픽의 규모가 크게 달라져 각각 독립적으로 스케일해야 할 때다.
+
+TypeScript, 빌드 단계 없이.
+서버·프런트를 전부 TypeScript로 옮기되 빌드 산출물은 만들지 않았다. Node 24가
+실행할 때 타입만 벗겨내므로(type stripping) `node index.ts`로 바로 돌고, `tsc`는
+`npm run typecheck`에서 검사만 한다(noEmit). dist/도, tsx 같은 별도 런타임도 없다.
+대가는 상대 import에 실제 파일 이름을 그대로 써야 한다는 것(`./db.ts`) — Node는
+`./db.js`를 db.ts로 바꿔 찾아주지 않는다. 프런트는 Vite가 번들해야 하므로
+`tsc -b && vite build`로 빌드한다.
+
+옮겨서 실제로 얻은 것.
+추상적인 안전성 말고 두 가지가 잡혔다. 하나, `/api/metrics` 응답 모양을
+server/types.ts의 `MetricsResponse` 한 곳에 두고 서버·측정 스크립트·대시보드가
+공유하게 했더니, Bulkhead로 DB 풀을 읽기/쓰기로 쪼갠 뒤 부하 측정 스크립트가
+사라진 `m.pool.total`을 계속 읽고 있던 게 컴파일에서 드러났다. JS일 때는 화면에
+undefined가 찍힐 뿐 아무도 몰랐다. 둘, 소켓 이벤트 계약을 제네릭 타입으로
+못박았다. HTTP는 경로를 틀리면 404가 돌아오지만 소켓 이벤트는 이름이 문자열이라
+`"typing"`을 `"typeing"`으로 써도 에러조차 안 나고 조용히 아무 일도 일어나지
+않는다. 그래서 타입으로 잡는 이득이 HTTP 쪽보다 크다.
 
 ---
 
@@ -127,16 +162,17 @@ SSE가 HTTP 위에서 그대로 동작해 더 단순하다.
 일시적 오류(429, 5xx)만 지수 백오프로 재시도하고, 400·404처럼 재시도해도
 소용없는 오류는 바로 실패시키도록 나눴다.
 
-```js
+```ts
 const RETRYABLE = new Set([429, 500, 503, 504]);
 
-async function withRetry(fn) {
+async function withRetry<T>(fn: () => Promise<T>): Promise<T> {
   const delays = [500, 1000, 2000];        // 0.5s → 1s → 2s
   for (let attempt = 0; ; attempt++) {
     try { return await fn(); }
     catch (e) {
-      if (!RETRYABLE.has(e?.status) || attempt >= delays.length) throw e;
-      await new Promise((r) => setTimeout(r, delays[attempt]));
+      const wait = delays[attempt];        // 없으면 = 재시도를 다 썼다
+      if (!RETRYABLE.has(statusOf(e)) || wait === undefined) throw e;
+      await new Promise((r) => setTimeout(r, wait));
     }
   }
 }
@@ -169,24 +205,28 @@ async function withRetry(fn) {
 
 테스트
 
-단위 테스트 19개 통과 (`npm test`). 외부 의존성 없이 도는 순수 로직에 집중했다.
+단위 테스트 48개 통과 (`npm test`). 외부 의존성 없이 도는 순수 로직에 집중했다.
 
 | 대상 | 검증 내용 |
 |---|---|
 | 청킹 | 짧은 글은 1조각, 긴 글은 겹치며 분할, 겹침 구간 일치 |
 | Rate Limiter | 용량만큼 통과·초과분 429, IP별 격리, 시간 경과 시 토큰 충전 |
+| Token Bucket | 버스트 허용·초과 거절, 대기 시간 안내, 충전 상한, 키별 격리, drop·sweep 회수 |
 | Circuit Breaker | 임계치 도달 시 오픈, 성공 시 카운터 리셋, 쿨다운 후 복구 |
 | Admission Control | 상한까지 통과, 큐 양보, 큐 포화 시 즉시 거절, 대기 데드라인 |
+| 채팅 방 관리 | 퇴장 시 목록에서 제거(유령 사용자 방지), 빈 방 정리(메모리 누수 방지), 히스토리 50개 상한, 방 격리 |
 
 방어 레이어가 이 프로젝트의 핵심 주장이라, 주장하는 동작을 테스트로 고정했다.
+Token Bucket은 `take(key, now)`처럼 시각을 인자로 받게 만들어, sleep 없이 시간을
+주입해 충전 동작을 결정적으로 검증한다.
 
 ---
 
 ## 핵심 로직 발췌
 
-거절 게이트 — 이 프로젝트의 정체성 (server/routes/chat.js)
+거절 게이트 — 이 프로젝트의 정체성 (server/routes/chat.ts)
 
-```js
+```ts
 const topSimilarity = rows[0]?.similarity ?? 0;
 
 if (rows.length === 0 || topSimilarity < THRESHOLD) {
@@ -196,7 +236,7 @@ if (rows.length === 0 || topSimilarity < THRESHOLD) {
 }
 ```
 
-벡터 검색 — pgvector 코사인 거리 (server/routes/chat.js)
+벡터 검색 — pgvector 코사인 거리 (server/routes/chat.ts)
 
 ```sql
 select c.content, d.filename,
@@ -207,9 +247,9 @@ select c.content, d.filename,
  limit 5
 ```
 
-겹치는 청킹 (server/chunk.js)
+겹치는 청킹 (server/chunk.ts)
 
-```js
+```ts
 const step = size - overlap;                 // 200 - 40 = 160
 for (let start = 0; start < words.length; start += step) {
   chunks.push(words.slice(start, start + size).join(" "));
@@ -217,7 +257,23 @@ for (let start = 0; start < words.length; start += step) {
 }
 ```
 
-전체 코드는 저장소 참고. 흐름별 상세 설명은 STUDY.md에 정리해두었다.
+소켓 이벤트 계약 — 오타를 컴파일에서 잡는 장치 (server/realtime/types.ts)
+
+```ts
+// 클라이언트 → 서버 (서버가 듣는 이벤트)
+export interface ClientToServer {
+  join: (payload: { nickname: string; room: string }) => void;
+  message: (payload: { text: string }) => void;
+  typing: () => void;
+}
+
+// 이 계약을 제네릭으로 넘기면 emit/on의 이름과 payload가 타입 검사를 받는다
+const io: Server<ClientToServer, ServerToClient, ..., SocketData> =
+  new Server(httpServer, { ... });
+```
+
+전체 코드는 저장소 참고. 흐름별 상세 설명은 문서 Q&A는 STUDY.md,
+실시간 채팅은 STUDY-REALTIME.md에 정리해두었다.
 
 ---
 
@@ -231,6 +287,9 @@ for (let start = 0; start < words.length; start += step) {
   자동 측정하는 것이 다음 목표다.
 - 클라이언트가 응답 도중 떠나도 서버는 LLM 스트림을 끝까지 소비한다.
   연결 종료를 감지해 생성을 중단하는 것이 다음 개선 후보다.
+- 실시간 채팅의 방 상태와 최근 기록이 서버 메모리에 있다. 서버가 죽으면 날아가고,
+  서버를 여러 대로 늘리면 방이 갈라진다. 영구 저장과 Redis 어댑터가 다음 단계다.
+  (문서 Q&A 쪽 인메모리 캐시가 서버 한 대를 전제하는 것과 같은 한계다.)
 
 ---
 
@@ -251,6 +310,7 @@ cd web && npm install && npm run dev   # http://localhost:5173
 테스트와 대시보드 데모:
 
 ```bash
-cd server && npm test                # 단위 테스트 19개
+cd server && npm test                # 단위 테스트 48개
+cd server && npm run typecheck       # tsc는 검사만 (빌드 산출물 없음)
 cd server && npm run start:demo      # mock LLM 모드 — 대시보드에서 장애 주입 시연
 ```

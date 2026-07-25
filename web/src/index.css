@@ -595,7 +595,9 @@ body {
 
 .metrics-grid {
   display: grid;
-  grid-template-columns: repeat(4, 1fr);
+  /* 고정 4열이면 타일을 하나 늘릴 때마다 마지막 줄에 하나만 덩그러니 남는다.
+     (실시간 채팅 타일이 늘면서 실제로 그랬다) 폭에 맞춰 열 수가 정해지게 둔다. */
+  grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
   gap: 12px;
   margin-bottom: 24px;
 }
@@ -673,5 +675,534 @@ body {
 @media (max-width: 640px) {
   .metrics-grid {
     grid-template-columns: repeat(2, 1fr);
+  }
+}
+
+/* ============================================================
+   실시간 채팅 (Socket.IO)
+
+   문서 Q&A 화면과 색·폰트 토큰은 그대로 공유한다.
+   다만 .messages는 양쪽이 같은 이름을 쓰므로, 여기서는 .chatroom 아래로
+   범위를 좁혀 문서 Q&A 화면에 영향이 가지 않게 한다.
+   ============================================================ */
+
+/* ---------- 입장 화면 ---------- */
+
+.join {
+  /* 상단 네비(48px) 아래 남는 공간을 채운다.
+     100vh로 두면 네비 높이만큼 넘쳐서 스크롤이 생긴다. */
+  flex: 1;
+  min-height: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 24px;
+}
+
+.join-card {
+  width: 100%;
+  max-width: 360px;
+  background: #fff;
+  border: 1px solid #e4e7eb;
+  border-radius: 16px;
+  padding: 32px 28px;
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+
+.join-card h1 {
+  font-size: 22px;
+  font-weight: 700;
+}
+
+.join-sub {
+  font-size: 13px;
+  color: #6b7280;
+  margin-bottom: 8px;
+}
+
+.join-card input {
+  padding: 12px 14px;
+  border: 1px solid #d6dae0;
+  border-radius: 10px;
+  font-size: 14px;
+  font-family: inherit;
+  outline: none;
+}
+
+.join-card input:focus {
+  border-color: #2563eb;
+}
+
+.join-card button {
+  margin-top: 4px;
+  padding: 12px;
+  border: none;
+  border-radius: 10px;
+  background: #2563eb;
+  color: #fff;
+  font-size: 15px;
+  font-weight: 600;
+  cursor: pointer;
+}
+
+.join-card button:disabled {
+  background: #cdd3dc;
+  cursor: default;
+}
+
+/* ---------- 채팅방 ---------- */
+
+/* ---------- 로비 (방 목록 + 대화창) ---------- */
+
+.live {
+  flex: 1;
+  min-height: 0;
+  display: flex;
+}
+
+.roomlist {
+  width: 240px;
+  flex-shrink: 0;
+  background: #fff;
+  border-right: 1px solid #e4e7eb;
+  padding: 16px;
+  display: flex;
+  flex-direction: column;
+  overflow-y: auto;
+}
+
+.roomlist-me {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  font-size: 14px;
+  font-weight: 700;
+  padding-bottom: 14px;
+  border-bottom: 1px solid #eef0f3;
+  margin-bottom: 14px;
+}
+
+.roomlist-me-dot {
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: #22c55e;
+  flex-shrink: 0;
+}
+
+.roomlist-new {
+  display: flex;
+  gap: 6px;
+  margin-bottom: 18px;
+}
+
+.roomlist-new input {
+  flex: 1;
+  min-width: 0;
+  padding: 8px 10px;
+  border: 1px solid #d6dae0;
+  border-radius: 8px;
+  font-size: 13px;
+  font-family: inherit;
+  outline: none;
+}
+
+.roomlist-new input:focus {
+  border-color: #2563eb;
+}
+
+.roomlist-new button {
+  padding: 0 12px;
+  border: none;
+  border-radius: 8px;
+  background: #2563eb;
+  color: #fff;
+  font-size: 13px;
+  font-weight: 600;
+  cursor: pointer;
+  flex-shrink: 0;
+}
+
+.roomlist-new button:disabled {
+  background: #cdd3dc;
+  cursor: default;
+}
+
+.roomlist-title {
+  font-size: 12px;
+  font-weight: 700;
+  color: #6b7280;
+  margin-bottom: 8px;
+}
+
+.roomlist-title span {
+  color: #9ca3af;
+  font-weight: 600;
+}
+
+.roomlist-items {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.roomlist-empty {
+  font-size: 13px;
+  color: #9ca3af;
+  line-height: 1.6;
+  padding: 4px 2px;
+}
+
+.roomlist-item {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  width: 100%;
+  padding: 9px 10px;
+  border: none;
+  border-radius: 8px;
+  background: none;
+  font-family: inherit;
+  font-size: 14px;
+  color: #1f2328;
+  text-align: left;
+  cursor: pointer;
+}
+
+.roomlist-item:hover {
+  background: #f3f4f6;
+}
+
+.roomlist-item.active {
+  background: #eef2ff;
+  color: #2563eb;
+  font-weight: 700;
+}
+
+.roomlist-name {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.roomlist-count {
+  flex-shrink: 0;
+  font-size: 12px;
+  color: #6b7280;
+  background: #eef0f3;
+  border-radius: 999px;
+  padding: 1px 7px;
+}
+
+.roomlist-item.active .roomlist-count {
+  background: #dbe4ff;
+  color: #2563eb;
+}
+
+.live-empty {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  padding: 24px;
+  text-align: center;
+}
+
+.live-empty-title {
+  font-size: 15px;
+  color: #6b7280;
+}
+
+.live-empty-sub {
+  font-size: 13px;
+  color: #9ca3af;
+}
+
+/* ---------- 대화창 ---------- */
+
+.chatroom {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  background: #fff;
+}
+
+.room-quiet {
+  margin: auto;
+  color: #9ca3af;
+  font-size: 14px;
+}
+
+.room-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 14px 20px;
+  border-bottom: 1px solid #e4e7eb;
+  flex-shrink: 0;
+}
+
+.room-name {
+  font-size: 16px;
+  font-weight: 700;
+}
+
+.room-me {
+  font-size: 13px;
+  color: #9ca3af;
+}
+
+.leave {
+  border: 1px solid #d6dae0;
+  background: #fff;
+  border-radius: 8px;
+  padding: 6px 12px;
+  font-size: 13px;
+  cursor: pointer;
+}
+
+.leave:hover {
+  background: #f3f4f6;
+}
+
+.room-body {
+  flex: 1;
+  display: flex;
+  min-height: 0;
+}
+
+/* 문서 Q&A의 .messages와 이름이 겹친다. 공통 레이아웃(flex/스크롤)은
+   그대로 물려받고, 말풍선 간격만 여기서 좁힌다. */
+.chatroom .messages {
+  padding: 20px;
+  gap: 8px;
+}
+
+.system {
+  align-self: center;
+  font-size: 12px;
+  color: #9ca3af;
+  background: #f3f4f6;
+  padding: 4px 12px;
+  border-radius: 999px;
+  margin: 4px 0;
+}
+
+.bubble-row {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  max-width: 75%;
+}
+
+.bubble-row.mine {
+  align-self: flex-end;
+  align-items: flex-end;
+}
+
+.bubble-nick {
+  font-size: 12px;
+  color: #6b7280;
+  margin: 0 0 2px 4px;
+}
+
+.bubble {
+  display: flex;
+  align-items: flex-end;
+  gap: 6px;
+  padding: 9px 13px;
+  border-radius: 14px;
+  background: #f1f3f5;
+  font-size: 14px;
+  line-height: 1.5;
+  word-break: break-word;
+}
+
+.bubble-row.mine .bubble {
+  background: #2563eb;
+  color: #fff;
+}
+
+.bubble-time {
+  font-size: 10px;
+  color: #9ca3af;
+  flex-shrink: 0;
+}
+
+.bubble-row.mine .bubble-time {
+  color: #cdd9f8;
+}
+
+.typing {
+  font-size: 12px;
+  color: #9ca3af;
+  padding: 2px 4px;
+  font-style: italic;
+}
+
+.users {
+  width: 180px;
+  flex-shrink: 0;
+  border-left: 1px solid #eef0f3;
+  padding: 16px;
+  overflow-y: auto;
+}
+
+.users-title {
+  font-size: 12px;
+  font-weight: 700;
+  color: #6b7280;
+  margin-bottom: 10px;
+}
+
+.user {
+  font-size: 13px;
+  padding: 5px 8px;
+  border-radius: 6px;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.user::before {
+  content: "";
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: #22c55e;
+}
+
+.user.me {
+  font-weight: 700;
+}
+
+.chat-error {
+  background: #fef2f2;
+  color: #b91c1c;
+  font-size: 13px;
+  text-align: center;
+  padding: 8px;
+  cursor: pointer;
+  flex-shrink: 0;
+}
+
+/* ---------- 이미지 ---------- */
+
+.image-wrap {
+  display: flex;
+  align-items: flex-end;
+  gap: 6px;
+}
+
+.bubble-row.mine .image-wrap {
+  flex-direction: row-reverse;
+}
+
+/* 상자 크기는 컴포넌트가 인라인 style로 박아준다 (Room.tsx의 displaySize).
+   여기서 %로 잡으면 부모가 내용에 맞춰 줄어드는 상자라 기준이 순환한다. */
+.bubble-image {
+  display: block;
+  flex-shrink: 0;
+  line-height: 0;
+  border-radius: 14px;
+  overflow: hidden;
+  border: 1px solid #e4e7eb;
+  background: #f1f3f5; /* 로드되기 전 자리를 채우는 색 */
+}
+
+.bubble-image img {
+  width: 100%;
+  height: 100%;
+  /* 클라이언트가 알려준 비율과 실제 비율이 다를 수 있다(값을 못 믿는다).
+     그때 이미지가 찌그러지는 대신 잘리게 둔다. */
+  object-fit: cover;
+  display: block;
+}
+
+.attach {
+  width: 40px;
+  flex-shrink: 0;
+  border: 1px solid #d6dae0;
+  border-radius: 10px;
+  background: #fff;
+  color: #6b7280;
+  font-size: 18px;
+  line-height: 1;
+  cursor: pointer;
+}
+
+.attach:hover:not(:disabled) {
+  background: #f3f4f6;
+  color: #2563eb;
+}
+
+.attach:disabled {
+  color: #cdd3dc;
+  cursor: default;
+}
+
+.chatroom.dragging {
+  outline: 2px dashed #2563eb;
+  outline-offset: -6px;
+}
+
+.drop-hint {
+  background: #eef2ff;
+  color: #2563eb;
+  font-size: 13px;
+  font-weight: 600;
+  text-align: center;
+  padding: 8px;
+  flex-shrink: 0;
+  pointer-events: none;
+}
+
+.send-bar {
+  display: flex;
+  gap: 8px;
+  padding: 14px 20px;
+  border-top: 1px solid #e4e7eb;
+  flex-shrink: 0;
+}
+
+.send-bar input {
+  flex: 1;
+  padding: 12px 14px;
+  border: 1px solid #d6dae0;
+  border-radius: 10px;
+  font-size: 14px;
+  font-family: inherit;
+  outline: none;
+}
+
+.send-bar input:focus {
+  border-color: #2563eb;
+}
+
+.send-bar button {
+  padding: 0 20px;
+  border: none;
+  border-radius: 10px;
+  background: #2563eb;
+  color: #fff;
+  font-size: 14px;
+  font-weight: 600;
+  cursor: pointer;
+}
+
+.send-bar button:disabled {
+  background: #cdd3dc;
+  cursor: default;
+}
+
+@media (max-width: 600px) {
+  .users {
+    display: none;
   }
 }

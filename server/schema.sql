@@ -22,6 +22,25 @@ create table if not exists chunks (
 create index if not exists chunks_embedding_idx
   on chunks using hnsw (embedding vector_cosine_ops);
 
+-- 채팅에 올린 이미지.
+-- 바이트를 DB에 직접 담는다(bytea). 파일시스템에 두면 배포 환경마다 디스크가
+-- 휘발되거나 여러 대일 때 서로 안 보이는 문제가 생기는데, 그걸 피하려고
+-- 이미 있는 DB에 맡겼다. 대신 큰 값이 DB로 들어오므로 업로드 크기를 제한하고
+-- (routes/images.ts) 조회는 전용 커넥션 풀로 격리한다 (db.ts의 mediaPool).
+--
+-- id가 uuid인 이유: URL에 그대로 노출되므로 연속된 정수면 남의 이미지를
+-- 번호만 바꿔가며 훑을 수 있다.
+create table if not exists chat_images (
+  id uuid primary key,
+  mime text not null,
+  bytes bytea not null,
+  -- 화면에서 자리를 미리 잡아 이미지가 뜰 때 대화가 밀리지 않게 하려고 같이 둔다.
+  -- 클라이언트가 잰 값이라 신뢰하지 않고 저장 전에 범위를 자른다.
+  width int not null,
+  height int not null,
+  created_at timestamptz not null default now()
+);
+
 -- 질문마다 유사도/토큰/응답시간을 남긴다.
 -- 거절 임계값(SIMILARITY_THRESHOLD) 튜닝은 이 로그의 top_similarity를 보고 한다.
 create table if not exists query_logs (

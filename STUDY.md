@@ -1,8 +1,12 @@
 # DocChat 공부 노트
 
 이 노트만 보고 프로젝트를 백지에서 다시 칠 수 있게 만든 문서.
-모든 코드는 실제 파일과 대조해 확인한 것이다.
 순서: 기획 → 지도 → 만드는 순서 → 흐름별 코드(주석) → 원리 → 헷갈리는 것 → 검색할 것 → 자가 점검.
+
+> 파일 경로는 TypeScript 전환에 맞춰 갱신했지만, 아래 코드 조각은 아직 전환 전의
+> JavaScript 형태다(타입 표기 없음). 흐름과 판단을 익히는 데는 그대로 쓸 수 있고,
+> 실제 타입이 붙은 코드는 소스 파일을 보면 된다.
+> 실시간 채팅 부분은 [STUDY-REALTIME.md](STUDY-REALTIME.md)에 따로 있다.
 
 ---
 
@@ -45,19 +49,19 @@
 
 | 칸 | 하는 일 | 파일 |
 |---|---|---|
-| A1 | 파일 받아 글자 꺼내기 | server/routes/documents.js |
-| A2 | 겹치게 조각내기 | server/chunk.js |
-| A3 | 조각을 숫자(벡터)로 | server/gemini.js |
-| A4 | DB에 저장 | server/routes/documents.js |
-| B1 | 질문 받고 스트리밍 준비 | server/routes/chat.js |
-| B2 | 질문을 숫자로 | server/gemini.js |
-| B3 | 가까운 조각 5개 찾기 | server/routes/chat.js |
-| B4 | 멀면 거절 | server/routes/chat.js |
-| B5 | 프롬프트 조립 | server/gemini.js |
-| B6 | 답을 조각조각 전송 | server/routes/chat.js |
-| B7 | 화면에서 받아 붙이기 | web/src/api.js |
+| A1 | 파일 받아 글자 꺼내기 | server/routes/documents.ts |
+| A2 | 겹치게 조각내기 | server/chunk.ts |
+| A3 | 조각을 숫자(벡터)로 | server/gemini.ts |
+| A4 | DB에 저장 | server/routes/documents.ts |
+| B1 | 질문 받고 스트리밍 준비 | server/routes/chat.ts |
+| B2 | 질문을 숫자로 | server/gemini.ts |
+| B3 | 가까운 조각 5개 찾기 | server/routes/chat.ts |
+| B4 | 멀면 거절 | server/routes/chat.ts |
+| B5 | 프롬프트 조립 | server/gemini.ts |
+| B6 | 답을 조각조각 전송 | server/routes/chat.ts |
+| B7 | 화면에서 받아 붙이기 | web/src/api.ts |
 
-A는 문서 넣기 4칸, B는 질문하기 7칸. 이 둘을 이어주는 게 server/index.js(서버 뼈대).
+A는 문서 넣기 4칸, B는 질문하기 7칸. 이 둘을 이어주는 게 server/index.ts(서버 뼈대).
 
 ---
 
@@ -68,13 +72,13 @@ A는 문서 넣기 4칸, B는 질문하기 7칸. 이 둘을 이어주는 게 ser
 
 | 순서 | 만드는 것 | 왜 이때 | 켜보기(성공 신호) |
 |---|---|---|---|
-| 1 | chunk.js | 의존성 0, 순수함수 | 450단어 → 조각 3개? |
-| 2 | gemini.js (임베딩만) | 첫 외부 연결 확인 | 벡터 길이 768? |
-| 3 | schema.sql + db.js | 담을 그릇 | select 1+1 동작? |
-| 4 | ingest.js (저장 스크립트) | 셋을 처음 합침 | 저장 완료 로그? |
-| 5 | search.js (검색 스크립트) | 줄기의 심장 | 관련 조각이 1등? |
-| 6 | ask.js (생성, 한 방에) | 줄기 완성 | 터미널에 답 출력? |
-| 7 | index.js (서버로 옮기기) | 스크립트를 라우트로 | curl로 답 받기? |
+| 1 | chunk.ts | 의존성 0, 순수함수 | 450단어 → 조각 3개? |
+| 2 | gemini.ts (임베딩만) | 첫 외부 연결 확인 | 벡터 길이 768? |
+| 3 | schema.sql + db.ts | 담을 그릇 | select 1+1 동작? |
+| 4 | ingest.ts (저장 스크립트) | 셋을 처음 합침 | 저장 완료 로그? |
+| 5 | search.ts (검색 스크립트) | 줄기의 심장 | 관련 조각이 1등? |
+| 6 | ask.ts (생성, 한 방에) | 줄기 완성 | 터미널에 답 출력? |
+| 7 | index.ts (서버로 옮기기) | 스크립트를 라우트로 | curl로 답 받기? |
 | 8+ | 거절 → 스트리밍 → 화면 → 로깅·재시도 | 가지, 우선순위 순 | 하나씩 켜보며 |
 
 6단계까지가 줄기다. 여기까지면 화면이 없어도 RAG는 완성.
@@ -97,14 +101,14 @@ npm install express cors pg dotenv multer @google/genai
 ## A0. 서버 뼈대 (한 번 만들고 안 건드림)
 
 상황: 라우트들을 연결하는 입구. 보일러플레이트라 검색해서 붙여도 됨
-파일: server/index.js
+파일: server/index.ts
 
 ```js
 import "dotenv/config";                 // 맨 위. 환경변수를 먼저 로드해야 아래가 읽음
 import express from "express";
 import cors from "cors";
-import documentsRouter from "./routes/documents.js";
-import chatRouter from "./routes/chat.js";
+import documentsRouter from "./routes/documents.ts";
+import chatRouter from "./routes/chat.ts";
 
 const app = express();
 app.use(cors());                        // 브라우저(다른 포트)에서 부를 수 있게
@@ -119,7 +123,7 @@ app.listen(4000, () => console.log("http://localhost:4000"));
 ## A1. 파일 받아 글자 꺼내기
 
 상황: 사용자가 브라우저에서 파일을 올렸고, 서버가 그걸 받는 자리
-파일: server/routes/documents.js
+파일: server/routes/documents.ts
 
 ```js
 // upload.single("file") = multer가 파일 1개를 받아서 req.file에 담아줌
@@ -142,7 +146,7 @@ router.post("/", upload.single("file"), async (req, res) => {
 ## A2. 겹치게 조각내기
 
 상황: text에 문서 전체 글이 통째로 있음. 검색하려면 잘라야 함
-파일: server/chunk.js
+파일: server/chunk.ts
 
 ```js
 export function chunkText(text, size = 200, overlap = 40) {
@@ -177,7 +181,7 @@ export function chunkText(text, size = 200, overlap = 40) {
 ## A3. 조각을 숫자(벡터)로
 
 상황: 조각 배열이 생김. 뜻으로 검색하려면 각 조각을 숫자로 바꿔야 함
-파일: server/gemini.js
+파일: server/gemini.ts
 
 ```js
 export async function embedTexts(texts, taskType = "RETRIEVAL_DOCUMENT") {
@@ -220,7 +224,7 @@ async function chunkAndEmbed(text) {
 ## A4. DB에 저장
 
 상황: 조각 배열과 벡터 배열이 손에 있음. 짝지어 저장
-파일: server/routes/documents.js
+파일: server/routes/documents.ts
 
 ```js
 // pool.connect() = 연결 하나를 빌림 (트랜잭션은 같은 연결에서 이어져야 해서)
@@ -270,7 +274,7 @@ try {
 ## B1. 질문 받고 스트리밍 준비
 
 상황: 사용자가 채팅창에 질문을 쳐서 보냄
-파일: server/routes/chat.js
+파일: server/routes/chat.ts
 
 ```js
 router.post("/", async (req, res) => {
@@ -296,7 +300,7 @@ router.post("/", async (req, res) => {
 ## B2. 질문을 숫자로
 
 상황: 질문을 조각들과 비교하려면 같은 형식(숫자)이어야 함
-파일: server/gemini.js
+파일: server/gemini.ts
 
 ```js
 export async function embedQuery(text) {
@@ -315,7 +319,7 @@ export async function embedQuery(text) {
 ## B3. 가까운 조각 찾기
 
 상황: 질문 벡터가 생김. 저장된 조각 중 뜻이 가까운 걸 골라옴
-파일: server/routes/chat.js
+파일: server/routes/chat.ts
 
 ```sql
 select
@@ -343,7 +347,7 @@ const { rows } = await pool.query(위_SQL, [
 ## B4. 멀면 거절
 
 상황: 검색 결과가 손에 있음. 쓸만한지 판단하는 갈림길
-파일: server/routes/chat.js
+파일: server/routes/chat.ts
 
 ```js
 // rows[0] = 가장 비슷한 조각
@@ -373,7 +377,7 @@ if (rows.length === 0 || topSimilarity < THRESHOLD) {
 ## B5. 프롬프트 조립
 
 상황: 쓸만한 조각 5개 확보. 이걸 근거로 답하라고 시킴
-파일: server/gemini.js
+파일: server/gemini.ts
 
 ```js
 // 답변보다 근거를 먼저 보냄 → 스트리밍 중에도 출처가 화면에 떠 있음
@@ -410,7 +414,7 @@ ${contextBlock}
 ## B6. 답을 조각조각 전송
 
 상황: AI가 답을 만들기 시작. 다 기다리지 않고 오는 대로 전송
-파일: server/routes/chat.js
+파일: server/routes/chat.ts
 
 ```js
 const stream = await streamAnswer(question, rows);
@@ -444,7 +448,7 @@ res.end();
 ## B7. 화면에서 받아 붙이기
 
 상황: 서버가 조각을 계속 보내는 중. 브라우저가 받아 화면에 이어붙임
-파일: web/src/api.js
+파일: web/src/api.ts
 
 ```js
 // EventSource(브라우저 기본 SSE 도구)는 GET만 됨.

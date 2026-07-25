@@ -3,11 +3,17 @@
 # DocChat
 
 문서(txt, md)를 업로드하면 그 문서 내용을 근거로만 답변하는 RAG 챗봇입니다.
-React, Express, PostgreSQL(pgvector), Gemini API로 만들었습니다.
+여기에 여러 명이 같은 방에서 대화하는 실시간 채팅을 함께 넣었습니다.
+TypeScript, React, Express, PostgreSQL(pgvector), Socket.IO, Gemini API로 만들었습니다.
+
+한 서버가 두 종류의 실시간을 다룹니다 — 답변 토큰은 SSE(한 방향), 채팅은
+WebSocket(양방향 1:N). 왜 나누지 않고 한 프로세스에 뒀는지는
+[STUDY-REALTIME.md](STUDY-REALTIME.md)에 정리했습니다.
 
 > 함께 보기 — [PORTFOLIO.md](PORTFOLIO.md): 기술 선택과 그 이유 ·
 > [RELIABILITY.md](RELIABILITY.md): 부하·장애 대응 설계와 측정값 ·
-> [STUDY.md](STUDY.md): 흐름별 상세 설명
+> [STUDY.md](STUDY.md): 문서 Q&A 흐름별 상세 설명 ·
+> [STUDY-REALTIME.md](STUDY-REALTIME.md): 실시간 채팅 흐름별 상세 설명
 
 ![답변과 근거 출처](docs/demo-answer.png)
 
@@ -81,9 +87,63 @@ HNSW 인덱스로 검색합니다. 문서 메타데이터랑 벡터를 한 DB에
 Rate Limiter(Token Bucket), Admission Control(동시 상한 + 대기 데드라인),
 Bulkhead(읽기/쓰기 풀 격리), Circuit Breaker, Graceful Degradation을 직접
 구현했습니다. 병목은 추측하지 않고 부하를 걸어 측정했고(LLM이 아니라 DB 풀이었습니다),
-각 레이어의 동작을 단위 테스트로 고정했습니다. (`cd server && npm test` — 19개)
+각 레이어의 동작을 단위 테스트로 고정했습니다. (`cd server && npm test` — 48개)
 
 설계 근거·대안 비교·측정값은 [RELIABILITY.md](RELIABILITY.md)에 정리했습니다.
+
+### 실시간 채팅
+
+닉네임을 정하면 로비로 들어가고, 왼쪽 방 목록에서 방을 고르거나 새로 만들어
+입장합니다. 방 목록은 인원수와 함께 실시간으로 갱신되고, 방 안에서는 접속자
+목록, 입력 중 표시, 입·퇴장 알림, 재입장 시 최근 50개 기록까지 동작합니다.
+
+방 "생성"과 "입장"을 따로 두지 않았습니다 — 없는 이름으로 들어가면 그 자리에서
+만들어지고, 마지막 사람이 나가면서 대화 기록도 없으면 목록에서 사라집니다.
+빈 방을 남겨두면 한 번 쓴 이름이 영원히 쌓이는데, 치워줄 사람이 없는 구조라
+스스로 정리되는 쪽을 택했습니다.
+
+문서 Q&A와 같은 서버·같은 포트(4000)를 씁니다. 나누지 않은 이유는 전송 방식이
+다를 뿐 운영해야 할 프로세스를 늘릴 이유는 없기 때문입니다. 합치고 나니 오히려
+중복이 드러났습니다 — HTTP 요청 제한과 채팅 도배 제한이 같은 Token Bucket을 각자
+복사해 갖고 있었고, 이걸 `server/tokenbucket.ts` 하나로 뽑아 양쪽이 공유하게
+했습니다(값만 용도별로 다르게 줍니다). 대시보드에도 채팅 방·접속자 수와 도배로
+막힌 메시지 수가 함께 뜹니다.
+
+### 이미지 전송
+
+파일 선택, 붙여넣기(스크린샷), 드래그앤드롭 세 가지로 이미지를 보냅니다.
+이미지는 Postgres에 `bytea`로 저장합니다.
+
+**바이트를 소켓으로 보내지 않습니다.** 먼저 HTTP로 업로드하고, 소켓에는 id만
+실어 보냅니다. 소켓에 실으면 사진 한 장이 방 인원수만큼 복제돼 나가고, 메모리에
+든 최근 50개 기록에도 이미지가 통째로 쌓입니다.
+
+**주소는 서버가 만듭니다.** 업로드는 URL이 아니라 id만 돌려줍니다. 클라이언트가
+URL을 정할 수 있으면 `https://evil.example.com/tracker.gif` 같은 주소를 방 전체에
+뿌려서, 그 방 사람들 브라우저가 남의 서버로 요청을 보내게 만들 수 있습니다.
+서버는 받은 id가 자기가 발급한 것인지 확인한 뒤에야 주소를 붙입니다.
+
+**형식은 앞머리 바이트로 판별합니다.** 파일명도 Content-Type도 클라이언트가
+적어 보내는 값이라 믿지 않습니다. png/jpg/gif/webp의 고정 서명을 직접 확인하고,
+**SVG는 일부러 뺐습니다** — SVG는 XML이라 `<script>`가 들어가고, 같은 오리진에서
+내려보내는 순간 저장형 XSS가 됩니다. 응답에는 `X-Content-Type-Options: nosniff`를
+같이 보냅니다.
+
+**조회는 별도 커넥션 풀로 격리했습니다.** 이미지 조회는 메시지가 뜰 때마다 나가는
+잦고 무거운 읽기라, 질문 검색용 읽기 풀에 태우면 사진 많은 방 하나가 이 프로젝트가
+"사수하겠다"고 말한 경로를 굶깁니다. id가 uuid이고 내용이 안 바뀌므로 불변 캐시
+헤더를 줘서, DB까지 오는 건 각 이미지의 첫 요청뿐입니다.
+
+### 이벤트 계약을 타입으로 고정
+
+HTTP는 경로를 틀리면 404가 바로 오지만, 소켓 이벤트는 이름이 문자열이라
+`"typing"`을 `"typeing"`으로 써도 아무 일도 안 일어납니다 — 에러조차 안 납니다.
+그래서 Socket.IO를 제네릭으로 감싸 `emit`/`on`의 이름과 payload를 컴파일 때
+검사하게 했습니다. SSE 이벤트도 같은 이유로 유니온 타입으로 못박아, 서버가
+이벤트를 추가하면 프런트에서 처리를 빠뜨렸을 때 타입 검사에 걸립니다.
+
+서버는 빌드 단계 없이 Node가 타입만 벗겨 실행합니다(`node index.ts`). `tsc`는
+검사기로만 씁니다(`npm run typecheck`).
 
 ### 스트리밍과 일시 오류 대응
 
@@ -95,8 +155,9 @@ Bulkhead(읽기/쓰기 풀 격리), Circuit Breaker, Graceful Degradation을 직
 
 ## 기술 스택
 
+- 언어: TypeScript (서버·프런트 모두)
 - 프론트: React (Vite)
-- 백엔드: Node.js + Express
+- 백엔드: Node.js + Express + Socket.IO
 - DB: PostgreSQL + pgvector
 - AI: Gemini API — `gemini-embedding-001`(임베딩) + `gemini-3.6-flash`(생성), 무료 티어로 동작
 
@@ -131,6 +192,10 @@ npm run dev   # http://localhost:5173
 - "반품 배송비는 누가 부담해?" → 조건별로 나눠서 답변
 - "프랑스의 수도는?" → 거절 (문서에 없는 내용)
 
+실시간 채팅은 상단 "실시간 채팅" 탭에서 확인합니다. 브라우저 탭을 두 개 열고
+같은 방 이름으로 들어가면 서로 대화가 오갑니다. 텍스트 대화는 DB 없이도 되고,
+이미지 전송은 `chat_images` 테이블이 있어야 합니다(schema.sql에 포함).
+
 DB 스키마가 적용되지 않은 경우(볼륨을 먼저 만든 경우):
 
 ```bash
@@ -141,28 +206,49 @@ docker exec -i docchat-db psql -U postgres -d docchat < server/schema.sql
 
 ```
 server/
-  index.js            Express 앱, /api/metrics, 에러 미들웨어
-  db.js               pg 커넥션 풀 — 읽기/쓰기 분리 (Bulkhead)
-  gemini.js           임베딩 / 스트리밍 생성 / 지수 백오프 재시도
-  chunk.js            겹침 청킹
-  cache.js            질문 임베딩 캐시 (TTL)
-  ratelimit.js        사용자별 Token Bucket 요청 제한
-  admission.js        동시 처리 상한 + 대기 데드라인 (load shedding)
-  breaker.js          LLM 회로 차단기
-  admin.js            장애 주입 엔드포인트 보호 (토큰 / 루프백)
-  faults.js           런타임 장애 주입 스위치 (데모용)
+  index.ts            Express 앱 + Socket.IO 부착, /api/metrics, 에러 미들웨어
+  types.ts            SSE 이벤트 유니온, /api/metrics 응답 타입 (한 곳에서 관리)
+  db.ts               pg 커넥션 풀 — 읽기/쓰기 분리 (Bulkhead)
+  gemini.ts           임베딩 / 스트리밍 생성 / 지수 백오프 재시도
+  chunk.ts            겹침 청킹
+  cache.ts            질문 임베딩 캐시 (TTL)
+  imagetype.ts        업로드 바이트의 앞머리로 형식 판별 (SVG 제외)
+  images.ts           채팅 이미지 저장/조회 (DB를 아는 코드를 여기 가둠)
+  tokenbucket.ts      Token Bucket 알고리즘 — HTTP·소켓 제한이 공유
+  ratelimit.ts        사용자(IP)별 HTTP 요청 제한
+  admission.ts        동시 처리 상한 + 대기 데드라인 (load shedding)
+  breaker.ts          LLM 회로 차단기
+  admin.ts            장애 주입 엔드포인트 보호 (토큰 / 루프백)
+  faults.ts           런타임 장애 주입 스위치 (데모용)
   routes/
-    documents.js      업로드, 목록, 원문 열람(GET), 수정(PUT), 삭제
-    chat.js           검색 → 거절 게이트 → 회로 확인 → SSE 스트리밍 → 로깅
+    documents.ts      업로드, 목록, 원문 열람(GET), 수정(PUT), 삭제
+    chat.ts           검색 → 거절 게이트 → 회로 확인 → SSE 스트리밍 → 로깅
+    images.ts         채팅 이미지 업로드(POST) / 조회(GET, 불변 캐시)
+  realtime/
+    types.ts          소켓 이벤트 계약 (web와 짝)
+    gateway.ts        연결·입장·브로드캐스트·퇴장 핸들러
+    rooms.ts          방 상태 (메시지 50개 + 접속자) 메모리
+    ratelimit.ts      소켓별 도배 제한
   scripts/            부하 테스트, 캐시 벤치, 방어 레이어 시연
   schema.sql
-  *.test.js           단위 테스트 19개 (청킹·rate limit·breaker·admission)
+  tsconfig.json       빌드 없음 — Node가 타입을 벗겨 실행, tsc는 검사만
+  *.test.ts           단위 테스트 48개
+                      (청킹·token bucket·rate limit·breaker·admission·rooms)
 web/
   src/
-    api.js            fetch + SSE 파싱
-    App.jsx
+    types.ts          서버와 맞춘 계약 (문서·SSE 이벤트·metrics)
+    api.ts            fetch + SSE 파싱 (이벤트별 핸들러 디스패치)
+    App.tsx           상단 탭 — 문서 Q&A / 실시간 채팅 / 대시보드
     components/       Sidebar(업로드/목록) / Chat / Message(근거 표시)
                       DocModal(열람·수정 팝업) / Dashboard(부하·장애 대시보드)
+    realtime/
+      types.ts        소켓 이벤트 계약 (server와 짝)
+      socket.ts       타입 있는 소켓 (같은 오리진에 연결)
+      LiveChat.tsx    소켓 연결 관리 + 닉네임 → 로비 → 방 전환
+      Nickname.tsx    닉네임 입력
+      RoomList.tsx    방 목록 + 새 방 만들기
+      Room.tsx        구독·전송·접속자 목록
+  vite.config.ts      /api 프록시 + /socket.io 프록시(ws)
 sample-docs/          데모용 가상 쇼핑몰 문서
 docs/                 README·포트폴리오용 스크린샷
 docker-compose.yml    pgvector 포함 Postgres
@@ -182,5 +268,13 @@ docker-compose.yml    pgvector 포함 Postgres
   만들어서 자동으로 측정하는 게 다음 목표입니다.
 - 클라이언트가 응답 도중 떠나도 서버는 LLM 스트림을 끝까지 소비합니다.
   연결 종료(close) 이벤트를 감지해 생성을 중단하는 것이 다음 개선 후보입니다.
+- 채팅 기록이 서버 메모리에만 있어서 서버가 재시작하면 사라집니다. 단계별로는
+  ① 지금: 단일 서버 인메모리(방·메시지·presence·도배 방지) → ② 메시지를
+  Postgres에 남겨 durability 확보 → ③ Socket.IO Redis 어댑터로 pub/sub을 붙이고
+  presence를 Redis로 옮겨, 다른 서버에 붙은 사용자에게도 메시지가 가게 하는
+  순서를 생각하고 있습니다. 임베딩 캐시가 인메모리인 것과 같은 성격의 한계입니다.
+- 채팅에 로그인이 없어 닉네임을 아무나 쓸 수 있습니다.
+- 서버와 프런트가 이벤트 계약 타입을 각자 복사해 갖고 있습니다. 지금 규모에선
+  워크스페이스를 도입하는 비용이 더 커서 미뤘고, 커지면 공용 패키지로 뺄 계획입니다.
 - 배포는 Neon(pgvector 지원) + Render + Netlify 무료 티어 조합으로 올릴
   예정입니다.

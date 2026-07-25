@@ -1,0 +1,8 @@
+{
+  // 앱 코드(브라우저에서 도는 src/)와 빌드 설정(Node에서 도는 vite.config.ts)은
+  // 실행 환경이 달라 쓸 수 있는 API가 다르다. 한 설정으로 묶으면 앱 코드에서
+  // Node API가 보이거나, 설정 파일에서 DOM이 보이는 이상한 상태가 된다.
+  // 그래서 프로젝트를 둘로 나누고 여기서는 참조만 한다.
+  "files": [],
+  "references": [{ "path": "./tsconfig.app.json" }, { "path": "./tsconfig.node.json" }]
+}

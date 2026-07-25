@@ -4,9 +4,11 @@
 
 ドキュメントをアップロードすると、その内容だけを根拠に回答するRAGチャットボット。
 ドキュメントにない質問には作り話をせず拒否し、回答ごとに根拠の出典を表示する。
+複数人が同じ部屋で会話するリアルタイムチャットも、同じサーバーに載せている。
 
 - リポジトリ: https://github.com/JINWORLD13/docchat
-- スタック: React (Vite) · Node/Express · PostgreSQL + pgvector · Gemini API
+- スタック: TypeScript · React (Vite) · Node/Express · PostgreSQL + pgvector ·
+  Socket.IO · Gemini API
 - ローカル実行: 下記[実行](#実行)の3ステップ
 
 ---
@@ -54,9 +56,11 @@ LLM障害を注入すると連続失敗が積み重なってサーキットブ�
 
 ```
   ブラウザ (React)
-     │  質問 (POST, SSEで応答を受信)
+     │  質問 (POST, SSEで応答を受信) · チャット (WebSocket)
      ▼
-  Express サーバー
+  Express サーバー + Socket.IO  (1プロセス · 同じポート 4000)
+     │
+     ├─ チャット: ソケット → 連投制限(Token Bucket) → 同じ部屋へブロードキャスト
      │
      ├─ 取り込み: ファイル → チャンキング(重複) → 埋め込み → 保存
      │                                       │
@@ -74,9 +78,11 @@ LLM障害を注入すると連続失敗が積み重なってサーキットブ�
                           Gemini API (生成, ストリーミング)
 ```
 
-核心は2つのフローだ。ドキュメントを取り込むフロー(チャンキング → 埋め込み(エンベディン
-グ) → 保存)と、質問するフロー(検索 → 拒否判定 → 生成)。生成の呼び出しは最後の一片にす
-ぎず、その手前の検索と拒否こそがこのプロジェクトの本体である。
+ドキュメントQ&Aの核心は2つのフローだ。ドキュメントを取り込むフロー(チャンキング →
+埋め込み(エンベディング) → 保存)と、質問するフロー(検索 → 拒否判定 → 生成)。
+生成の呼び出しは最後の一片にすぎず、その手前の検索と拒否こそがこのプロジェクトの
+本体である。チャットは転送方式が違うだけで同じプロセスに載っており、
+rate limitのような防御ロジックをドキュメントQ&Aと共有している。
 
 ---
 
@@ -97,8 +103,37 @@ LLM障害を注入すると連続失敗が積み重なってサーキットブ�
 もっともらしい嘘(ハルシネーション)が出てくる。そこで検索の最高類似度がしきい値未満な
 らLLMを呼び出さずに拒否する。ハルシネーションを防ぎ、トークンも節約できる。
 
-ストリーミングはSSE。回答はサーバーからクライアントへ流れる一方向なので、WebSocketまで
-持ち出す必要がない。 SSEはHTTPの上でそのまま動作し、よりシンプルだ。
+回答はSSE、チャットはWebSocket。1つのアプリに「リアルタイム」が2つあるが、性格が違う。
+回答のトークンはサーバーからクライアントへ流れる一方向の1:1なのでSSEで十分だ —
+HTTPの上でそのまま動くので、プロキシも再接続もタダで手に入る。一方チャットは双方向で、
+1人の発言を部屋全体(1:N)へ押し出す必要があるためWebSocketが適している。
+転送方式は好みではなく、必要な方向が決めた。
+
+それでもサーバーは分けなかった。転送方式が違うことと、プロセスを分ける理由があること
+は別の話だ。同じExpressのHTTPサーバー1つにSocket.IOを取り付け、ポート・デプロイ・
+CORSを1つに保ち、防御ロジックも共有している。統合して初めて重複が見えた —
+HTTPリクエスト制限とチャットの連投制限が、同じToken Bucketをそれぞれコピーして持って
+いた。これをserver/tokenbucket.tsの1箇所に抽出し、両者が共有して値だけを変える
+(HTTPは容量10・毎秒5個補充、チャットは5・2)。回収の仕方も違う — ソケットは
+disconnectというシグナルがあるので`drop()`で正確に回収し、IPはそのシグナルがないため
+定期的な`sweep()`でアイドルのバケツを掃除する。分けるべきなのは、2つのトラフィックの
+規模が大きく離れ、それぞれ独立にスケールさせる必要が出たときだ。
+
+TypeScriptへ、ビルド段階なしで。サーバー・フロントエンドをすべてTypeScriptへ移した
+が、ビルド成果物は作らない。Node 24が実行時に型だけを剥がす(type stripping)ので
+`node index.ts`でそのまま動き、`tsc`は`npm run typecheck`で検査するだけだ(noEmit)。
+dist/も、tsxのような別ランタイムも要らない。代償は、相対importに実際のファイル名をその
+まま書く必要があること(`./db.ts`) — Nodeは`./db.js`をdb.tsに読み替えて探してはくれ
+ない。フロントエンドはViteがバンドルするため`tsc -b && vite build`でビルドする。
+
+移して実際に得たもの。抽象的な安全性ではなく、具体的に2つ引っかかった。1つ、
+`/api/metrics`のレスポンスの形をserver/types.tsの`MetricsResponse`という1箇所に置き、
+サーバー・計測スクリプト・ダッシュボードが共有するようにしたところ、BulkheadでDBプール
+を読み取り/書き込みに分割した後、負荷計測スクリプトが消えた`m.pool.total`を読み続けて
+いたことがコンパイルで表に出た。JSのときは画面にundefinedが出るだけで、誰も気づかな
+かった。2つ、ソケットのイベント契約をジェネリック型で固定した。HTTPはパスを間違えれば
+404が返るが、ソケットのイベントは名前が文字列なので、`"typing"`を`"typeing"`と書いても
+エラーすら出ず、静かに何も起こらない。だから型で捕まえる利得がHTTP側より大きい。
 
 ---
 
@@ -127,16 +162,17 @@ LLM障害を注入すると連続失敗が積み重なってサーキットブ�
 を目にした。一時的なエラー(429、5xx)だけを指数バックオフでリトライし、400・404のように
 リトライしても無駄なエラーは即座に失敗させるよう切り分けた。
 
-```js
+```ts
 const RETRYABLE = new Set([429, 500, 503, 504]);
 
-async function withRetry(fn) {
+async function withRetry<T>(fn: () => Promise<T>): Promise<T> {
   const delays = [500, 1000, 2000];        // 0.5s → 1s → 2s
   for (let attempt = 0; ; attempt++) {
     try { return await fn(); }
     catch (e) {
-      if (!RETRYABLE.has(e?.status) || attempt >= delays.length) throw e;
-      await new Promise((r) => setTimeout(r, delays[attempt]));
+      const wait = delays[attempt];        // なければ = リトライを使い切った
+      if (!RETRYABLE.has(statusOf(e)) || wait === undefined) throw e;
+      await new Promise((r) => setTimeout(r, wait));
     }
   }
 }
@@ -169,25 +205,28 @@ async function withRetry(fn) {
 
 テスト
 
-単体テスト19個通過(`npm test`)。外部依存なしで回る純粋ロジックに集中した。
+単体テスト48個通過(`npm test`)。外部依存なしで回る純粋ロジックに集中した。
 
 | 対象 | 検証内容 |
 |---|---|
 | チャンキング | 短いテキストは1チャンク、長いテキストはオーバーラップしながら分割、オーバーラップ区間の一致 |
 | Rate Limiter | 容量分は通過・超過分は429、IPごとの分離、時間経過によるトークン補充 |
+| Token Bucket | バースト許容・超過は拒否、待ち時間の通知、補充の上限、キーごとの分離、drop・sweepでの回収 |
 | サーキットブレーカー(Circuit Breaker) | しきい値到達でオープン、成功時にカウンターリセット、クールダウン後の復旧 |
 | Admission Control | 上限まで通過、キューへの譲歩、キュー飽和時の即時拒否、待機デッドライン |
+| チャットの部屋管理 | 退出時に一覧から削除(幽霊ユーザー防止)、空き部屋の掃除(メモリリーク防止)、履歴は50件まで、部屋ごとの分離 |
 
 防御レイヤーがこのプロジェクトの核心的な主張であるため、
-主張する動作をテストで固定した。
+主張する動作をテストで固定した。Token Bucketは`take(key, now)`のように時刻を引数で
+受け取る形にして、sleepなしに時間を注入し補充の挙動を決定的に検証している。
 
 ---
 
 ## コアロジックの抜粋
 
-拒否ゲート — このプロジェクトのアイデンティティ (server/routes/chat.js)
+拒否ゲート — このプロジェクトのアイデンティティ (server/routes/chat.ts)
 
-```js
+```ts
 const topSimilarity = rows[0]?.similarity ?? 0;
 
 if (rows.length === 0 || topSimilarity < THRESHOLD) {
@@ -197,7 +236,7 @@ if (rows.length === 0 || topSimilarity < THRESHOLD) {
 }
 ```
 
-ベクトル検索 — pgvectorのコサイン距離 (server/routes/chat.js)
+ベクトル検索 — pgvectorのコサイン距離 (server/routes/chat.ts)
 
 ```sql
 select c.content, d.filename,
@@ -208,9 +247,9 @@ select c.content, d.filename,
  limit 5
 ```
 
-オーバーラップ付きチャンキング (server/chunk.js)
+オーバーラップ付きチャンキング (server/chunk.ts)
 
-```js
+```ts
 const step = size - overlap;                 // 200 - 40 = 160
 for (let start = 0; start < words.length; start += step) {
   chunks.push(words.slice(start, start + size).join(" "));
@@ -218,7 +257,24 @@ for (let start = 0; start < words.length; start += step) {
 }
 ```
 
-全コードはリポジトリを参照。フローごとの詳細な解説はSTUDY.md(韓国語)にまとめてある。
+ソケットのイベント契約 — タイプミスをコンパイルで捕まえる仕掛け
+(server/realtime/types.ts)
+
+```ts
+// クライアント → サーバー (サーバーが聞くイベント)
+export interface ClientToServer {
+  join: (payload: { nickname: string; room: string }) => void;
+  message: (payload: { text: string }) => void;
+  typing: () => void;
+}
+
+// この契約をジェネリックで渡すと、emit/on の名前とpayloadが型検査を受ける
+const io: Server<ClientToServer, ServerToClient, ..., SocketData> =
+  new Server(httpServer, { ... });
+```
+
+全コードはリポジトリを参照。フローごとの詳細な解説は、ドキュメントQ&AはSTUDY.md、
+リアルタイムチャットはSTUDY-REALTIME.md(いずれも韓国語)にまとめてある。
 
 ---
 
@@ -233,6 +289,10 @@ for (let start = 0; start < words.length; start += step) {
   自動測定するのが次の目標だ。
 - クライアントが応答の途中で離脱しても、サーバーはLLMのストリームを最後まで消費する。
   接続の切断を検知して生成を中断するのが次の改善候補だ。
+- リアルタイムチャットの部屋の状態と直近の履歴がサーバーのメモリ上にある。
+  サーバーが落ちれば消え、サーバーを複数台に増やせば部屋が分裂する。永続化と
+  Redisアダプターが次の段階だ。
+  (ドキュメントQ&A側のインメモリキャッシュが1台前提なのと同じ限界である。)
 
 ---
 
@@ -253,6 +313,7 @@ cd web && npm install && npm run dev   # http://localhost:5173
 テストとダッシュボードのデモ:
 
 ```bash
-cd server && npm test                # 単体テスト19件
+cd server && npm test                # 単体テスト48件
+cd server && npm run typecheck       # tscは検査のみ (ビルド成果物なし)
 cd server && npm run start:demo      # mock LLMモード — ダッシュボードで障害注入をデモ
 ```
