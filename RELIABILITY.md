@@ -224,6 +224,13 @@ MODE=breaker COUNT=9  node scripts/demo-defense.js    # Circuit Breaker + Degrad
 - Redis(공유 캐시 + Bull 큐): 서버가 여러 대가 되면 인메모리 캐시·큐는 인스턴스마다
   따로 놀아 한계가 있다. 그때 Redis로 간다. (참고한 Cosmos Tarot 프로젝트가 이 구성)
 - Prometheus + Grafana: 지금은 /api/metrics(JSON)로 충분. 대시보드는 운영 단계.
+- Pub/Sub · Presence(접속 상태) · 메시지 유실 방지: 이건 카톡·슬랙 같은 실시간
+  다중 사용자 메시징 시스템의 관심사다. DocChat은 문서 Q&A라 해당 없다.
+  다만 그 밑의 원리("잃으면 안 되는 건 영구 저장소에, 빠른 건 임시 저장소에")는
+  이미 지켰다 — 문서·청크는 Postgres에 트랜잭션으로 durable 저장하고, 잃어도 되는
+  임베딩 캐시만 인메모리에 둔다(날아가도 재생성=cache miss일 뿐). 그래서 나중에
+  Redis를 쓰더라도 그건 캐시나 로그 큐지, 데이터 본체가 아니다. 남의 아키텍처
+  조언을 시스템 종류에 맞게 걸러내는 것도 설계 판단이다.
 
 ---
 
