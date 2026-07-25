@@ -24,6 +24,21 @@ type Item =
   | { kind: "msg"; msg: ChatMessage }
   | { kind: "system"; id: string; text: string };
 
+// 시스템 알림에 붙일 로컬 id.
+//
+// crypto.randomUUID는 보안 컨텍스트(HTTPS 또는 localhost)에서만 존재한다.
+// http://<ip>:5173 같은 데모 주소로 열면 아예 함수가 없어서, 첫 입장 알림에서
+// setItems 안이 터지고 React가 화면 전체를 내려버린다. 개발 머신에서는 멀쩡한데
+// 배포 주소에서만 죽는 종류라, 대비해 둔다.
+let localSeq = 0;
+function newId(): string {
+  if (typeof crypto !== "undefined" && typeof crypto.randomUUID === "function") {
+    return crypto.randomUUID();
+  }
+  localSeq += 1;
+  return `sys-${Date.now()}-${localSeq}`;
+}
+
 // 이미지의 원본 크기를 미리 재둔다.
 // 이 값이 있어야 <img>가 뜨기 전에 자리를 잡아, 사진이 로드될 때 위의 대화가
 // 아래로 밀리지 않는다. 여기서 실패하면 브라우저가 못 읽는 파일이라는 뜻이라
@@ -54,7 +69,21 @@ export default function Room({ nickname, room, error, onDismissError, onLeave }:
     // socket.off("message")처럼 이름만 주면 그 이벤트의 리스너를 전부 지운다.
     // 지금은 LiveChat도 소켓을 듣고 있어서, 그렇게 하면 남의 구독까지 날아간다.
     const onHistory = (msgs: ChatMessage[]) => {
-      setItems(msgs.map((msg) => ({ kind: "msg", msg })));
+      setItems((prev) => {
+        if (prev.length === 0) return msgs.map((msg) => ({ kind: "msg", msg }));
+
+        // 재연결로 기록을 다시 받은 경우. 통째로 갈아끼우면 그동안 쌓인 시스템
+        // 알림이 사라지고, 대화가 서버 보관 상한(50개)을 넘겼으면 앞부분이
+        // 눈앞에서 잘려나간다. 이미 가진 메시지는 두고 처음 보는 것만 붙인다.
+        const seen = new Set<string>();
+        for (const it of prev) if (it.kind === "msg") seen.add(it.msg.id);
+
+        const fresh: Item[] = msgs
+          .filter((msg) => !seen.has(msg.id))
+          .map((msg) => ({ kind: "msg", msg }));
+
+        return fresh.length === 0 ? prev : [...prev, ...fresh];
+      });
     };
     const onMessage = (msg: ChatMessage) => {
       setItems((prev) => [...prev, { kind: "msg", msg }]);
@@ -65,7 +94,7 @@ export default function Room({ nickname, room, error, onDismissError, onLeave }:
         // (개발 모드 StrictMode 이중 실행 등으로 중복될 때 대비)
         const last = prev[prev.length - 1];
         if (last && last.kind === "system" && last.text === text) return prev;
-        return [...prev, { kind: "system", id: crypto.randomUUID(), text }];
+        return [...prev, { kind: "system", id: newId(), text }];
       });
     };
     const onPresence = (list: string[]) => setUsers(list);
@@ -83,7 +112,12 @@ export default function Room({ nickname, room, error, onDismissError, onLeave }:
 
     // 구독을 먼저 걸고 입장을 알린다 — 순서가 반대면 서버가 즉시 돌려주는
     // history를 놓칠 수 있다.
-    socket.emit("join", { room });
+    //
+    // 연결돼 있을 때만 보낸다. 끊긴 동안 emit하면 socket.io가 버퍼에 담았다가
+    // 재연결 순간 먼저 흘려보내는데, 그러면 LiveChat이 보내는 hello보다 join이
+    // 앞질러 나가 "먼저 닉네임을 정해주세요"로 거절당한다.
+    // 끊긴 상태에서의 재입장은 LiveChat의 connect 핸들러가 책임진다.
+    if (socket.connected) socket.emit("join", { room });
 
     return () => {
       socket.off("history", onHistory);
@@ -273,10 +307,21 @@ const MIN_SIDE = 48; // 아주 작은 이미지도 눌러볼 수 있을 만큼�
 function displaySize(width: number, height: number): { width: number; height: number } {
   const safeW = Math.max(1, width);
   const safeH = Math.max(1, height);
-  const scale = Math.min(MAX_W / safeW, MAX_H / safeH, 1); // 원본보다 키우지는 않는다
+  const base = Math.min(MAX_W / safeW, MAX_H / safeH, 1); // 원본보다 키우지는 않는다
+
+  // 하한(MIN_SIDE)은 가로·세로에 따로 걸면 안 된다. 그러면 비율이 깨진 상자가
+  // 나오고, 이미지는 object-fit: cover라 그만큼 잘려나간다 — 1000×10 배너가
+  // 320×48 상자에 담겨 원본의 일부만 확대돼 보이는 식이다.
+  // 그래서 하한도 비율을 유지한 채(양쪽 같은 배율로) 키우고,
+  // 그러다 상한을 넘게 되면 키우기를 포기한다. 상자 모양이 원본과 다른 것보다
+  // 작게 보이는 쪽이 낫다.
+  const needed = Math.max(MIN_SIDE / (safeW * base), MIN_SIDE / (safeH * base), 1);
+  const room = Math.max(Math.min(MAX_W / (safeW * base), MAX_H / (safeH * base)), 1);
+  const scale = base * Math.min(needed, room);
+
   return {
-    width: Math.max(MIN_SIDE, Math.round(safeW * scale)),
-    height: Math.max(MIN_SIDE, Math.round(safeH * scale)),
+    width: Math.round(safeW * scale),
+    height: Math.round(safeH * scale),
   };
 }
 

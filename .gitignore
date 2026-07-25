@@ -2,3 +2,6 @@ node_modules/
 dist/
 .env
 .DS_Store
+
+# 개인 학습 노트 — 저장소에 올리지 않는다
+STUDY.md

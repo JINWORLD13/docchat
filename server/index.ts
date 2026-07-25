@@ -12,19 +12,38 @@ import { admissionStats } from "./admission.ts";
 import { breakerState, reset as resetBreaker } from "./breaker.ts";
 import { faults } from "./faults.ts";
 import { requireAdmin, adminMode } from "./admin.ts";
+import { isAllowedOrigin } from "./origins.ts";
 import { attachRealtime } from "./realtime/gateway.ts";
 import { roomStats } from "./realtime/rooms.ts";
 import { chatRateLimitStats } from "./realtime/ratelimit.ts";
 import type { MetricsResponse } from "./types.ts";
 
 const app = express();
-// 프록시(배포 시 로드밸런서) 뒤에서 req.ip가 실제 클라이언트 IP를 가리키게 한다.
-// true(모든 홉 신뢰)가 아니라 1인 이유: 전부 신뢰하면 클라이언트가
-// X-Forwarded-For 헤더를 직접 넣어 req.ip를 조작할 수 있고, IP별로 버킷을
-// 나누는 rate limiter가 "요청마다 새 IP"로 통째로 우회된다.
-// 신뢰 범위를 우리 인프라(LB 1홉)로 못박아야 그 뒤 값이 스푸핑되지 않는다.
-app.set("trust proxy", 1);
-app.use(cors());
+
+// req.ip를 무엇으로 정할지. rate limiter가 IP별로 버킷을 나누므로,
+// 이 값이 조작 가능하면 제한 전체가 무의미해진다.
+//
+// 기본값은 "신뢰하지 않음"이다. 그러면 req.ip는 실제 TCP 연결의 주소가 되어
+// 클라이언트가 손댈 수 없다. 예전엔 여기가 무조건 1이었는데, 그건 앞에
+// 프록시가 실제로 있을 때만 맞는 설정이다. 프록시 없이 직접 노출된 상태에서
+// 1을 주면 Express가 X-Forwarded-For의 마지막 값을 req.ip로 삼기 때문에,
+// 헤더 한 줄로 "요청마다 새 IP"가 되어 제한이 통째로 뚫린다.
+// (실제로 그랬다 — XFF를 바꿔가며 30번 쏘면 30번 다 통과했다.)
+//
+// 그러므로 신뢰는 배포 형태를 아는 사람이 켜야 한다. 로드밸런서 뒤에 둘 때만
+// TRUST_PROXY에 홉 수를 준다. 홉 수를 정확히 세는 게 중요하다 — 실제보다
+// 크게 주면 그만큼 클라이언트가 써넣은 값을 신뢰하게 된다.
+const TRUST_PROXY = process.env.TRUST_PROXY ?? "0";
+app.set("trust proxy", Number.isNaN(Number(TRUST_PROXY)) ? TRUST_PROXY : Number(TRUST_PROXY));
+
+// 허용 오리진을 명시한다. 예전엔 cors()를 옵션 없이 써서 모든 오리진에
+// Access-Control-Allow-Origin: *를 내줬는데, 그러면 사용자가 방문한 아무 사이트나
+// 이 서버에 요청을 보내고 응답까지 읽을 수 있다. 로컬 데모에서는 그게 특히
+// 위험하다 — admin 엔드포인트가 "loopback이면 통과"로 열려 있고, 개발자 자신의
+// 브라우저에서 나가는 요청은 loopback이라 그 검사를 그대로 통과하기 때문이다.
+// (즉 아무 웹페이지나 장애 주입을 걸거나 문서를 지울 수 있었다.)
+// 목록은 소켓 쪽과 공유한다 — origins.ts 참고.
+app.use(cors({ origin: (origin, cb) => cb(null, isAllowedOrigin(origin)) }));
 app.use(express.json());
 
 app.get("/api/health", (_req, res) => {
@@ -76,7 +95,11 @@ app.post("/api/admin/reset", requireAdmin, (_req, res) => {
   res.json({ ok: true });
 });
 
-app.use("/api/documents", documentsRouter);
+// 문서 경로도 같은 사용자별 제한을 태운다. 질문과 예산을 공유하게 되는데,
+// 그 편이 낫다고 봤다 — 어차피 한 사람이 쓸 수 있는 총량을 정하는 게 목적이고,
+// 목록 조회는 매번 chunks 전체를 조인하므로 공짜가 아니다.
+// 변경(추가·수정·삭제)은 라우터 안에서 한 겹 더 막는다(requireWriteAccess).
+app.use("/api/documents", rateLimit, documentsRouter);
 // 이미지는 /api/chat보다 먼저 붙인다. 뒤에 두면 질문용 rate limiter를 먼저
 // 통과해야 해서, 사진 몇 장 올린 것 때문에 정작 질문이 막히게 된다.
 // 업로드에는 성격에 맞는 별도 제한이 라우터 안에 따로 있다.
@@ -84,11 +107,33 @@ app.use("/api/chat/image", imagesRouter);
 // rateLimit을 chat 앞단에 둔다: 맨 먼저 사용자별 폭주를 걸러낸 뒤 라우터로 넘긴다.
 app.use("/api/chat", rateLimit, chatRouter);
 
-const errorHandler: ErrorRequestHandler = (err, _req, res, _next) => {
-  if (typeof err === "object" && err !== null && (err as { code?: unknown }).code === "LIMIT_FILE_SIZE") {
+const errorHandler: ErrorRequestHandler = (err, _req, res, next) => {
+  const info = typeof err === "object" && err !== null ? (err as Record<string, unknown>) : {};
+
+  if (info.code === "LIMIT_FILE_SIZE") {
     res.status(400).json({ error: "파일은 1MB 이하만 업로드할 수 있습니다." });
     return;
   }
+
+  // 응답이 이미 나가기 시작했으면 여기서 상태 코드를 다시 쓸 수 없다.
+  // (SSE처럼 헤더를 먼저 보내는 경로가 그렇다.) 억지로 쓰면
+  // ERR_HTTP_HEADERS_SENT가 나므로, 연결을 정리해주는 Express 기본 핸들러에 넘긴다.
+  if (res.headersSent) {
+    next(err);
+    return;
+  }
+
+  // 4xx와 5xx를 구분한다. express.json()은 깨진 본문에 status 400을,
+  // 본문 크기 초과에는 413을 담아 던지는데, 예전엔 그걸 무시하고 전부 500으로
+  // 내렸다. 신뢰성이 주제인 서버에서 이건 단순한 표기 문제가 아니다 —
+  // 클라이언트 잘못이 서버 에러율에 섞이면, 그 지표를 보고 판단할 수 없게 된다.
+  const status = typeof info.status === "number" ? info.status : typeof info.statusCode === "number" ? info.statusCode : 500;
+
+  if (status >= 400 && status < 500) {
+    res.status(status).json({ error: "요청이 올바르지 않습니다." });
+    return;
+  }
+
   console.error(err);
   res.status(500).json({ error: "서버 오류가 발생했습니다." });
 };

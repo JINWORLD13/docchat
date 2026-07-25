@@ -62,6 +62,49 @@ test("쿨다운 직후 한 번만 더 실패해도 즉시 다시 열린다", asy
   assert.equal(breaker.isOpen(), true, "회복 안 됐으면 곧장 다시 열려야 한다");
 });
 
+// --- 반열림(half-open) ---
+//
+// 쿨다운이 끝나는 순간이 함정이다. 그때 밀려 있던 요청이 한꺼번에(최대
+// MAX_INFLIGHT만큼) 아직 죽어 있을지 모르는 API로 동시에 몰려간다.
+// 회로를 둔 이유가 "죽은 의존성을 계속 두들기지 않는 것"인데, 복구를
+// 확인하는 바로 그 순간에 정확히 그 짓을 하게 된다.
+
+test("쿨다운 직후에는 시험 요청 하나만 통과시킨다", async () => {
+  breaker.reset();
+  for (let i = 0; i < 3; i++) breaker.onFailure();
+  await sleep(120);
+
+  assert.equal(breaker.isOpen(), false, "첫 요청은 통과 — 복구됐는지 확인해봐야 한다");
+  assert.equal(breaker.isOpen(), true, "그 결과가 나오기 전까지 나머지는 계속 막는다");
+  assert.equal(breaker.isOpen(), true);
+});
+
+test("시험 요청이 성공하면 회로가 완전히 닫힌다", async () => {
+  breaker.reset();
+  for (let i = 0; i < 3; i++) breaker.onFailure();
+  await sleep(120);
+
+  breaker.isOpen(); // 시험 요청이 나감
+  breaker.onSuccess();
+
+  assert.equal(breaker.isOpen(), false);
+  assert.equal(breaker.isOpen(), false, "이제 모두 통과한다");
+  assert.equal(breaker.breakerState().consecutiveFailures, 0);
+});
+
+test("상태 조회는 시험권을 소비하지 않는다", async () => {
+  breaker.reset();
+  for (let i = 0; i < 3; i++) breaker.onFailure();
+  await sleep(120);
+
+  // 대시보드가 1초마다 부르는 자리. 여기서 시험권을 가져가버리면
+  // 정작 실제 요청은 영영 복구를 확인할 기회를 못 얻는다.
+  breaker.breakerState();
+  breaker.breakerState();
+
+  assert.equal(breaker.isOpen(), false, "시험권은 실제 요청 몫으로 남아 있어야 한다");
+});
+
 test("reset은 회로와 카운터를 모두 초기화한다", () => {
   for (let i = 0; i < 3; i++) breaker.onFailure();
   breaker.reset();

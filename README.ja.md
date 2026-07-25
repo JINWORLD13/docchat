@@ -8,12 +8,10 @@ TypeScript、React、Express、PostgreSQL(pgvector)、Socket.IO、Gemini APIで�
 
 ひとつのサーバーが2種類のリアルタイムを扱います — 回答トークンはSSE(一方向)、
 チャットはWebSocket(双方向1:N)。なぜ分けずに同じプロセスに置いたのかは
-[STUDY-REALTIME.md](STUDY-REALTIME.md)(韓国語)にまとめています。
+[PORTFOLIO.ja.md](PORTFOLIO.ja.md)にまとめています。
 
 > あわせて読む — [PORTFOLIO.ja.md](PORTFOLIO.ja.md): 技術選定とその理由 ·
-> [RELIABILITY.ja.md](RELIABILITY.ja.md): 負荷・障害対応の設計と測定値 ·
-> [STUDY.md](STUDY.md)(韓国語): ドキュメントQ&Aのフロー詳細 ·
-> [STUDY-REALTIME.md](STUDY-REALTIME.md)(韓国語): リアルタイムチャットのフロー詳細
+> [RELIABILITY.ja.md](RELIABILITY.ja.md): 負荷・障害対応の設計と測定値
 
 ![回答と根拠の出典](docs/demo-answer.png)
 
@@ -62,7 +60,7 @@ LLM APIを一度呼んで答えをもらうことと、信頼して使えるAI�
 ました。検索された最高類似度がしきい値(デフォルト0.62)より低ければ、LLMをそもそも呼び
 出さずに拒否します。もっともらしい嘘(ハルシネーション)を防ぎつつ、
 トークンも節約できます。しきい値は勘で決めたのではなく、
-サンプルドキュメントで関連質問(類似度0.66〜0.74)と無関係な質問(0.52〜0.59)を実測し、
+サンプルドキュメントで関連質問(類似度0.66〜0.74)と無関係な質問(0.53〜0.59)を実測し、
 その間に設定しました。ドキュメントが変わったら、質問ごとに `query_logs` に残る類似度を
 見て調整し直します。
 
@@ -91,10 +89,10 @@ HNSWインデックスで検索します。ドキュメントのメタデータ�
 ### 過負荷と障害に耐える設計
 
 Rate Limiter(Token Bucket)、Admission Control(同時実行の上限 + 待機デッドライン)、
-Bulkhead(読み取りプール/書き込みプールの分離)、Circuit Breaker、Graceful Degradationを
-自前で実装しました。ボトルネックは推測せず、実際に負荷をかけて測定し(LLMではなくDBプー
-ルでした)、各レイヤーの挙動を単体テストで固定しました。(`cd server && npm test` —
-48件)
+Bulkhead(読み取り·書き込み·メディアの3プールに隔離 — 画像の取得が質問応答を飢えさせな
+いように)、Circuit Breaker、Graceful Degradationを自前で実装しました。ボトルネックは推
+測せず、実際に負荷をかけて測定し(LLMではなくDBプールでした)、各レイヤーの挙動を単体テ
+ストで固定しました。(`cd server && npm test` — 61件)
 
 設計の根拠・代替案の比較・測定値は [RELIABILITY.ja.md](RELIABILITY.ja.md) にまとめてい
 ます。
@@ -190,13 +188,24 @@ npm install
 npm run dev
 ```
 
+サーバーが起動したかは `curl http://localhost:4000/api/health` →
+`{"ok":true}` で確認します。
+
 3. フロントエンド
 
 ```bash
 cd web
+cp .env.example .env   # 任意 — ローカルのデモは空のままで動作します
 npm install
 npm run dev   # http://localhost:5173
 ```
+
+フロントエンドの環境変数は `web/.env.example` にあります。Viteは `web/` 配下の
+`.env*` しか読まないため、サーバー側の `.env` に `VITE_` で始まる値を書いても
+ビルドには反映されません。今使っている値はダッシュボードの障害注入ボタン用の
+`VITE_ADMIN_TOKEN` ひとつだけで、ローカルはループバックなので空のままで構いません。
+この値を入れてデプロイするとバンドルに平文で入り、訪問者の誰もが読めるという点だけ
+注意してください(ファイル内の注意書きを参照)。
 
 `sample-docs/` のドキュメント2つをアップロードして、こんなふうに質問してみてください。
 (デモアプリは韓国語で応答します)
@@ -220,9 +229,10 @@ docker exec -i docchat-db psql -U postgres -d docchat < server/schema.sql
 
 ```
 server/
-  index.ts            Expressアプリ + Socket.IO装着, /api/metrics, エラーミドルウェア
+  index.ts            Expressアプリ + Socket.IO装着, /api/health, /api/metrics,
+                      エラーミドルウェア
   types.ts            SSEイベントのユニオン, /api/metrics のレスポンス型 (一元管理)
-  db.ts               pgコネクションプール — 読み取り/書き込み分離 (Bulkhead)
+  db.ts               pgコネクションプール — 読み取り·書き込み·メディアの3分割 (Bulkhead)
   gemini.ts           埋め込み / ストリーミング生成 / 指数バックオフのリトライ
   chunk.ts            オーバーラップするチャンキング
   cache.ts            質問埋め込みキャッシュ (TTL)
@@ -246,8 +256,9 @@ server/
   scripts/            負荷テスト, キャッシュベンチ, 防御レイヤーのデモ
   schema.sql
   tsconfig.json       ビルドなし — Nodeが型を剥がして実行, tscは検査のみ
-  *.test.ts           単体テスト48件
-                      (チャンキング·token bucket·rate limit·breaker·admission·rooms)
+  *.test.ts           単体テスト61件
+                      (チャンキング·token bucket·rate limit·breaker·admission·rooms
+                       ·imagetype)
 web/
   src/
     types.ts          サーバーと揃えた契約 (ドキュメント·SSEイベント·metrics)

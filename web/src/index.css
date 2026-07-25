@@ -504,6 +504,18 @@ body {
   margin-top: 4px;
 }
 
+/* 서버에 못 닿을 때. 이게 없으면 "서버가 죽었다"와 "지표가 전부 0이라
+   완벽히 건강하다"가 화면에서 똑같아 보인다. */
+.dash-offline {
+  margin-top: 16px;
+  padding: 10px 12px;
+  border: 1px solid #fca5a5;
+  border-radius: 8px;
+  background: #fef2f2;
+  color: #b91c1c;
+  font-size: 13px;
+}
+
 .dash-controls {
   display: flex;
   gap: 8px;

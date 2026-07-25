@@ -66,3 +66,33 @@ export async function describeImage(
 export function imageUrl(id: string): string {
   return `/api/chat/image/${id}`;
 }
+
+// --- 보관 기간 ---
+//
+// 이 테이블은 지우는 사람이 없으면 한 방향으로만 자란다. 게다가 방과 대화
+// 기록은 서버 메모리에 있어서 재시작하면 사라지는데, 그때 이미지 행은 그대로
+// 남아 아무도 참조하지 않는 바이트가 된다. 즉 가만히 둬도 쓰레기가 쌓인다.
+//
+// 업로드 제한(IMG_RL_*)이 있어도 상한이 되지 못한다. 그건 속도를 제한할 뿐
+// 총량을 제한하지 않기 때문이다 — 느리게 꾸준히 올리면 영구히 쌓인다.
+// 그래서 시간으로 자른다. 방 기록 자체가 최근 50개뿐인 MVP라 오래된 이미지는
+// 어차피 화면에서 사라진 지 오래다.
+const RETENTION_MS = Number(process.env.IMAGE_RETENTION_MS || 24 * 60 * 60 * 1000);
+const CLEANUP_INTERVAL_MS = 60 * 60 * 1000;
+
+export async function cleanupImages(retentionMs: number = RETENTION_MS): Promise<number> {
+  const { rowCount } = await mediaPool.query(
+    "delete from chat_images where created_at < now() - ($1::bigint * interval '1 millisecond')",
+    [retentionMs]
+  );
+  return rowCount ?? 0;
+}
+
+// 정리는 백그라운드로. 실패해도 서비스가 멈출 이유가 없으므로 로그만 남긴다.
+// unref()라 이 타이머가 프로세스 종료를 붙잡지 않는다.
+const cleaner = setInterval(() => {
+  cleanupImages().catch((e: unknown) => {
+    console.error("chat_images 정리 실패:", e instanceof Error ? e.message : e);
+  });
+}, CLEANUP_INTERVAL_MS);
+cleaner.unref();

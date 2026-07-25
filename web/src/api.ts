@@ -26,6 +26,15 @@ async function errorMessage(res: Response, fallback: string): Promise<string> {
   }
 }
 
+// 문서를 바꾸는 요청(추가·수정·삭제)에 붙이는 헤더.
+//
+// 서버는 이 세 가지를 관리자 스위치와 같은 규칙으로 막는다(server/admin.ts).
+// 로컬 데모는 루프백이라 토큰 없이 통과하고, 배포하면 토큰이 있어야 한다.
+// 읽기(목록·상세)는 그대로 열려 있으므로 여기 붙이지 않는다.
+function writeHeaders(base: Record<string, string> = {}): Record<string, string> {
+  return ADMIN_TOKEN ? { ...base, "x-admin-token": ADMIN_TOKEN } : base;
+}
+
 export async function fetchDocuments(): Promise<DocumentSummary[]> {
   const res = await fetch(`${BASE}/documents`);
   if (!res.ok) throw new Error("문서 목록을 불러오지 못했습니다.");
@@ -35,7 +44,11 @@ export async function fetchDocuments(): Promise<DocumentSummary[]> {
 export async function uploadDocument(file: File): Promise<{ id: number; filename: string }> {
   const form = new FormData();
   form.append("file", file);
-  const res = await fetch(`${BASE}/documents`, { method: "POST", body: form });
+  const res = await fetch(`${BASE}/documents`, {
+    method: "POST",
+    headers: writeHeaders(),
+    body: form,
+  });
   if (!res.ok) throw new Error(await errorMessage(res, "업로드에 실패했습니다."));
   return readJson(res);
 }
@@ -49,15 +62,18 @@ export async function fetchDocument(id: number): Promise<DocumentDetail> {
 export async function updateDocument(id: number, content: string): Promise<void> {
   const res = await fetch(`${BASE}/documents/${id}`, {
     method: "PUT",
-    headers: { "Content-Type": "application/json" },
+    headers: writeHeaders({ "Content-Type": "application/json" }),
     body: JSON.stringify({ content }),
   });
   if (!res.ok) throw new Error(await errorMessage(res, "수정에 실패했습니다."));
 }
 
 export async function deleteDocument(id: number): Promise<void> {
-  const res = await fetch(`${BASE}/documents/${id}`, { method: "DELETE" });
-  if (!res.ok) throw new Error("삭제에 실패했습니다.");
+  const res = await fetch(`${BASE}/documents/${id}`, {
+    method: "DELETE",
+    headers: writeHeaders(),
+  });
+  if (!res.ok) throw new Error(await errorMessage(res, "삭제에 실패했습니다."));
 }
 
 // --- 채팅 이미지 ---
@@ -137,6 +153,16 @@ export async function burst(count: number, question = "환불은 며칠 걸려?"
         return "rejected";
       }
       const text = await res.text().catch(() => "");
+
+      // 429 말고 다른 실패는 전부 error다. 예전엔 여기 검사가 없어서 500이든
+      // 401이든 아래 문자열 매칭을 지나 "ok"로 세어졌다.
+      if (!res.ok) return "error";
+
+      // 이 경로는 SSE라 응답 코드가 언제나 200이다. 처리 중 난 오류는 본문
+      // 안에 error 이벤트로 들어오므로, 상태 코드만 봐서는 실패를 못 잡는다.
+      // (DB가 죽어도 200이 떨어져 "정상"으로 집계되던 자리다.)
+      if (text.includes('"type":"error"')) return "error";
+
       if (text.includes("답변 생성이 어려워")) return "degraded";
       if (text.includes("관련 내용을 찾지 못했")) return "refused";
       return "ok";
@@ -181,11 +207,20 @@ function dispatch(event: ChatEvent, handlers: ChatHandlers): void {
 
 // SSE 응답을 읽어서 이벤트 타입별 핸들러를 호출한다.
 // EventSource는 POST를 못 보내서 fetch로 직접 파싱한다.
-export async function streamChat(question: string, handlers: ChatHandlers): Promise<void> {
+//
+// signal을 받는 이유: 사용자가 답변 도중 화면을 떠나거나 취소하면 읽기를
+// 중단해야 한다. 안 그러면 죽은 컴포넌트를 향해 루프가 끝까지 돌고, 서버 쪽은
+// 아무도 안 볼 답변을 만드느라 처리 슬롯을 계속 붙잡는다.
+export async function streamChat(
+  question: string,
+  handlers: ChatHandlers,
+  signal?: AbortSignal
+): Promise<void> {
   const res = await fetch(`${BASE}/chat`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ question }),
+    signal,
   });
   if (!res.ok) throw new Error(await errorMessage(res, "요청에 실패했습니다."));
   if (!res.body) throw new Error("스트림을 열 수 없습니다.");

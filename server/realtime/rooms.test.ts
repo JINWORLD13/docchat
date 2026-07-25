@@ -15,6 +15,8 @@ import {
   history,
   roomList,
   roomStats,
+  canJoin,
+  sweepRooms,
   reset,
 } from "./rooms.ts";
 import type { ChatMessage } from "./types.ts";
@@ -150,4 +152,60 @@ test("대화가 오간 방은 사람이 없어도 목록에 0명으로 남는다
 test("방이 하나도 없으면 빈 목록", () => {
   reset();
   assert.deepEqual(roomList(), []);
+});
+
+// --- 무한 증식 방지 ---
+//
+// 방은 이름만 대면 생긴다(join = 생성). 그래서 "기록이 있으면 유지한다"는
+// 규칙만 두면, 새 방에 한 마디씩 하고 나가는 것을 반복해 방을 무한히 쌓을 수
+// 있다. 비용은 메모리만이 아니다 — 방 목록은 구성이 바뀔 때마다 접속자
+// 전원에게 통째로 나가므로, 방 수가 곧 브로드캐스트 크기다.
+
+test("사람이 다 나간 방은 시간이 지나면 회수된다", () => {
+  reset();
+  const t0 = 1_000_000;
+  addUser("한마디방", "s1", "지영");
+  addMessage(msg("한마디방", "안녕"));
+  removeUser("한마디방", "s1");
+
+  assert.equal(roomStats().rooms, 1, "막 나간 직후에는 남아 있다");
+
+  // 아직 유예 시간 안
+  sweepRooms(60_000, t0);
+  assert.equal(roomStats().rooms, 1, "잠깐 나갔다 오는 사람을 위해 붙잡아둔다");
+
+  // 유예 시간을 넘기면 회수
+  sweepRooms(60_000, Date.now() + 61_000);
+  assert.equal(roomStats().rooms, 0, "빈 채로 오래 둔 방은 사라진다");
+});
+
+test("사람이 있는 방은 아무리 오래돼도 회수하지 않는다", () => {
+  reset();
+  addUser("사는방", "s1", "지영");
+  addMessage(msg("사는방", "안녕"));
+
+  sweepRooms(0, Date.now() + 10_000_000);
+
+  assert.equal(roomStats().rooms, 1);
+  assert.deepEqual(onlineUsers("사는방"), ["지영"]);
+});
+
+test("다시 사람이 들어오면 회수 대상에서 빠진다", () => {
+  reset();
+  addUser("돌아온방", "s1", "지영");
+  addMessage(msg("돌아온방", "안녕"));
+  removeUser("돌아온방", "s1");
+
+  addUser("돌아온방", "s2", "민수"); // 재입장
+
+  sweepRooms(0, Date.now() + 10_000_000);
+  assert.equal(roomStats().rooms, 1, "비운 시각 표시가 지워져야 한다");
+});
+
+test("이미 있는 방에는 상한과 무관하게 들어갈 수 있다", () => {
+  reset();
+  addUser("general", "s1", "지영");
+
+  assert.equal(canJoin("general"), true);
+  assert.equal(canJoin("새로운방"), true, "상한에 여유가 있으면 새 방도 만들 수 있다");
 });

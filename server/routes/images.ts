@@ -23,6 +23,13 @@ const uploadBuckets = new TokenBuckets(
   Number(process.env.IMG_RL_REFILL || 0.5) // 2초에 1장씩 회복
 );
 
+// 유휴 버킷 회수. 키가 IP라 "이제 안 온다"는 신호가 없으므로,
+// 지우지 않으면 한 번이라도 업로드한 IP가 전부 영구히 남는다
+// (ratelimit.ts와 같은 이유·같은 방식).
+const IDLE_MS = 10 * 60 * 1000;
+const sweeper = setInterval(() => uploadBuckets.sweep(IDLE_MS), 60 * 1000);
+sweeper.unref();
+
 const limitUploads: RequestHandler = (req, res, next) => {
   const ip = req.ip || req.socket.remoteAddress || "unknown";
   const result = uploadBuckets.take(ip);

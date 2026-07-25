@@ -14,13 +14,23 @@ create table if not exists chunks (
   document_id int not null references documents(id) on delete cascade,
   chunk_index int not null,
   content text not null,
-  -- gemini-embedding-001을 outputDimensionality=768로 사용 (gemini.js와 맞춰야 함)
+  -- gemini-embedding-001을 outputDimensionality=768로 사용 (gemini.ts와 맞춰야 함)
   embedding vector(768) not null
 );
 
 -- 코사인 거리(<=>) 검색용 인덱스
 create index if not exists chunks_embedding_idx
   on chunks using hnsw (embedding vector_cosine_ops);
+
+-- 외래키 쪽(참조하는 컬럼)에도 인덱스를 준다.
+-- Postgres는 참조되는 쪽(documents.id)에만 자동으로 인덱스를 만들어주고,
+-- 참조하는 쪽은 만들어주지 않는다. 그래서 없으면 세 군데가 전부 순차 스캔이 된다:
+--   - DELETE /api/documents/:id — cascade가 지울 chunks를 찾느라
+--   - PUT /api/documents/:id — 재임베딩 전 기존 청크를 지우는데, 그게 트랜잭션
+--     안에서 일어나 쓰기 풀(max 5) 커넥션을 그동안 붙잡고 있다
+--   - GET /api/documents — 목록마다 chunks 전체를 조인해 개수를 센다
+-- 문서 수가 적을 땐 안 보이다가, 코퍼스가 커지면 셋 다 같이 느려진다.
+create index if not exists chunks_document_id_idx on chunks (document_id);
 
 -- 채팅에 올린 이미지.
 -- 바이트를 DB에 직접 담는다(bytea). 파일시스템에 두면 배포 환경마다 디스크가
@@ -40,6 +50,11 @@ create table if not exists chat_images (
   height int not null,
   created_at timestamptz not null default now()
 );
+
+-- 보관 기간이 지난 이미지를 지울 때 쓴다 (server/images.ts의 cleanupImages).
+-- 이게 없으면 정리 작업이 매번 테이블 전체를 훑는데, 하필 그 테이블이
+-- 바이트를 통째로 담고 있어서 제일 무겁다.
+create index if not exists chat_images_created_at_idx on chat_images (created_at);
 
 -- 질문마다 유사도/토큰/응답시간을 남긴다.
 -- 거절 임계값(SIMILARITY_THRESHOLD) 튜닝은 이 로그의 top_similarity를 보고 한다.

@@ -60,9 +60,18 @@ export default function Message({ message }: { message: ChatItem }) {
         {message.content ? stripMarkdown(message.content) : <span className="cursor">▍</span>}
       </div>
 
-      {message.usage?.promptTokens != null && (
+      {/* 입력·출력 토큰은 각각 따로 없을 수 있다(usage 타입이 그렇게 돼 있다).
+          예전엔 입력 토큰만 보고 두 값을 함께 그려서, 출력 수가 안 오면
+          "출력 " 뒤가 빈 채로 남았다. 있는 값만 골라 이어 붙인다. */}
+      {(message.usage?.promptTokens != null || message.usage?.outputTokens != null) && (
         <div className="usage">
-          토큰 — 입력 {message.usage.promptTokens} · 출력 {message.usage.outputTokens}
+          토큰 —{" "}
+          {[
+            message.usage.promptTokens != null ? `입력 ${message.usage.promptTokens}` : null,
+            message.usage.outputTokens != null ? `출력 ${message.usage.outputTokens}` : null,
+          ]
+            .filter(Boolean)
+            .join(" · ")}
         </div>
       )}
     </div>

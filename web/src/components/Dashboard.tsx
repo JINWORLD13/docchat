@@ -9,26 +9,43 @@ import type { MetricsResponse } from "../types";
 type LogKind = "info" | "ok" | "warn" | "danger";
 
 interface LogEntry {
+  id: number;
   t: string;
   text: string;
   kind: LogKind;
 }
+
+let logSeq = 0;
 
 export default function Dashboard() {
   const [m, setM] = useState<MetricsResponse | null>(null);
   const [faultOn, setFaultOn] = useState(false);
   const [log, setLog] = useState<LogEntry[]>([]);
   const [busy, setBusy] = useState(false);
+  // 서버에 닿지 못하는 상태. null이면 정상.
+  const [offline, setOffline] = useState<string | null>(null);
   const prev = useRef<MetricsResponse | null>(null);
+  // 폴링이 겹치는 걸 막는다. 응답이 1초보다 오래 걸리면 요청이 쌓이고,
+  // 늦게 온 응답이 먼저 온 응답을 덮어써 prev가 뒤죽박죽이 된다 —
+  // 하필 그 상황(서버가 느려진 상황)이 회로 전이를 정확히 봐야 할 때다.
+  const inFlight = useRef(false);
+  // 장애 토글 직후 잠깐은 폴링이 버튼 상태를 되돌리지 못하게 막는다.
+  // 이미 날아가 있던 요청이 예전 값을 들고 늦게 도착하면 버튼이 깜빡인다.
+  const holdFaultUntil = useRef(0);
 
   function addLog(text: string, kind: LogKind = "info"): void {
-    setLog((l) => [{ t: new Date().toLocaleTimeString(), text, kind }, ...l].slice(0, 30));
+    logSeq += 1;
+    setLog((l) =>
+      [{ id: logSeq, t: new Date().toLocaleTimeString(), text, kind }, ...l].slice(0, 30)
+    );
   }
 
   // 1초마다 metrics 폴링 + 상태 전이 감지
   useEffect(() => {
     let alive = true;
     const tick = async (): Promise<void> => {
+      if (inFlight.current) return;
+      inFlight.current = true;
       try {
         const data = await fetchMetrics();
         if (!alive) return;
@@ -41,9 +58,22 @@ export default function Dashboard() {
         }
         prev.current = data;
         setM(data);
-        setFaultOn(data.faults.llmFail);
-      } catch {
-        /* 서버 꺼짐 등은 무시 */
+        if (Date.now() >= holdFaultUntil.current) setFaultOn(data.faults.llmFail);
+        setOffline((was) => {
+          if (was) addLog("서버 연결 복구", "ok");
+          return null;
+        });
+      } catch (e) {
+        if (!alive) return;
+        // 예전엔 여기서 조용히 삼켰다. 그러면 "서버가 죽었다"와 "모든 지표가
+        // 0이라 완벽히 건강하다"가 화면에서 똑같이 보인다 — 신뢰성 대시보드가
+        // 유일하게 헷갈리면 안 되는 두 상태다.
+        setOffline((was) => {
+          if (!was) addLog("서버에 연결하지 못했습니다 — 지표는 마지막 값입니다", "danger");
+          return e instanceof Error ? e.message : "연결 실패";
+        });
+      } finally {
+        inFlight.current = false;
       }
     };
     void tick();
@@ -62,7 +92,12 @@ export default function Dashboard() {
       const parts = [`정상 ${r.ok}`, `429거절 ${r.rejected}`];
       if (r.degraded) parts.push(`degraded ${r.degraded}`);
       if (r.refused) parts.push(`문서없음 ${r.refused}`);
-      addLog(`결과 → ${parts.join(", ")}`, r.rejected ? "danger" : "ok");
+      // 실패 건수를 반드시 보여준다. 예전엔 집계만 하고 화면에 안 띄워서,
+      // 서버가 죽어 20건이 전부 실패해도 초록색으로 "정상 0, 429거절 0"이
+      // 찍혔다 — 아무것도 안 됐는데 성공을 보고하는 셈이었다.
+      if (r.error) parts.push(`실패 ${r.error}`);
+      const kind: LogKind = r.error ? "danger" : r.rejected ? "warn" : "ok";
+      addLog(`결과 → ${parts.join(", ")}`, kind);
     } finally {
       setBusy(false);
     }
@@ -76,6 +111,7 @@ export default function Dashboard() {
       addLog(e instanceof Error ? e.message : "장애 주입에 실패했습니다.", "danger");
       return;
     }
+    holdFaultUntil.current = Date.now() + 1500;
     setFaultOn(next);
     addLog(
       next ? "LLM 장애 주입 ON — 생성이 실패하기 시작" : "LLM 장애 해제",
@@ -90,6 +126,7 @@ export default function Dashboard() {
       addLog(e instanceof Error ? e.message : "리셋에 실패했습니다.", "danger");
       return;
     }
+    holdFaultUntil.current = Date.now() + 1500;
     setFaultOn(false);
     addLog("리셋 — 장애 해제 + 회로 초기화", "info");
   }
@@ -105,6 +142,12 @@ export default function Dashboard() {
         <h2>부하·장애 대응 대시보드</h2>
         <p>상황을 주입하고, 방어 레이어가 반응하는 걸 실시간으로 관찰합니다.</p>
       </div>
+
+      {offline && (
+        <div className="dash-offline">
+          서버에 연결하지 못했습니다 ({offline}). 아래 지표는 마지막으로 받은 값입니다.
+        </div>
+      )}
 
       <div className="dash-controls">
         <button onClick={() => void handleBurst(20)} disabled={busy}>
@@ -189,8 +232,8 @@ export default function Dashboard() {
       <div className="event-log">
         <div className="event-log-title">이벤트 로그</div>
         {log.length === 0 && <div className="event-empty">버튼을 눌러 상황을 주입해보세요.</div>}
-        {log.map((e, i) => (
-          <div key={i} className={`event ${e.kind}`}>
+        {log.map((e) => (
+          <div key={e.id} className={`event ${e.kind}`}>
             <span className="event-time">{e.t}</span>
             {e.text}
           </div>

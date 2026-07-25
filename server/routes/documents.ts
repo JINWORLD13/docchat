@@ -5,6 +5,7 @@ import type pg from "pg";
 import { writePool as pool } from "../db.ts";
 import { chunkText } from "../chunk.ts";
 import { embedTexts } from "../gemini.ts";
+import { requireWriteAccess } from "../admin.ts";
 
 const router = Router();
 const upload = multer({
@@ -101,7 +102,7 @@ router.get("/:id", async (req, res) => {
   res.json(doc);
 });
 
-router.post("/", upload.single("file"), async (req, res) => {
+router.post("/", requireWriteAccess, upload.single("file"), async (req, res) => {
   if (!req.file) {
     res.status(400).json({ error: "파일이 없습니다." });
     return;
@@ -154,7 +155,7 @@ router.post("/", upload.single("file"), async (req, res) => {
 });
 
 // 원문을 수정하면 청크와 임베딩을 다시 만들어 통째로 교체한다.
-router.put("/:id", async (req, res) => {
+router.put("/:id", requireWriteAccess, async (req, res) => {
   const id = Number(req.params.id);
   if (!Number.isInteger(id)) {
     res.status(400).json({ error: "잘못된 문서 id입니다." });
@@ -202,7 +203,7 @@ router.put("/:id", async (req, res) => {
   }
 });
 
-router.delete("/:id", async (req, res) => {
+router.delete("/:id", requireWriteAccess, async (req, res) => {
   const id = Number(req.params.id);
   if (!Number.isInteger(id)) {
     res.status(400).json({ error: "잘못된 문서 id입니다." });

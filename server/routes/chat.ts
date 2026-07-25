@@ -10,7 +10,7 @@ const router = Router();
 const TOP_K = 5;
 const MAX_QUESTION_LENGTH = 500;
 // 이 값보다 유사도가 낮으면 문서에 없는 질문으로 보고 답변을 거절한다.
-// 샘플 문서 기준 관련 질문은 0.66~0.74, 무관 질문은 0.52~0.59로 갈려 그 사이인 0.62.
+// 샘플 문서 기준 관련 질문은 0.662~0.744, 무관 질문은 0.527~0.587로 갈려 그 사이인 0.62.
 const THRESHOLD = Number(process.env.SIMILARITY_THRESHOLD || 0.62);
 
 interface QueryLog {
@@ -75,10 +75,22 @@ router.post("/", async (req, res) => {
   res.setHeader("Connection", "keep-alive");
   res.flushHeaders();
 
+  // 클라이언트가 답변 도중 떠났는지.
+  //
+  // 이게 없으면 사용자가 탭을 닫아도 서버는 LLM 스트림을 끝까지 받아 읽고,
+  // 이미 죽은 소켓에 계속 write한다. 그동안 admission 슬롯(MAX_INFLIGHT=8) 하나가
+  // 잡혀 있으므로, 성질 급한 사용자가 몇 번 새로고침하면 아무도 안 보는 응답들이
+  // 처리 슬롯을 다 차지한다 — admission.ts가 피하려던 바로 그 상황이다.
+  let aborted = false;
+  res.on("close", () => {
+    aborted = true;
+  });
+
   // 보낼 수 있는 이벤트를 ChatEvent 유니온으로 못박는다.
   // 프런트(web/src/types.ts)가 같은 유니온을 읽으므로, 여기서 이벤트를 하나
   // 추가하면 프런트에서 처리를 빠뜨렸을 때 타입 검사에 걸린다.
   const send = (data: ChatEvent): void => {
+    if (aborted || res.writableEnded) return;
     res.write(`data: ${JSON.stringify(data)}\n\n`);
   };
   const started = Date.now();
@@ -150,6 +162,9 @@ router.post("/", async (req, res) => {
     try {
       const stream = await streamAnswer(question, rows);
       for await (const chunk of stream) {
+        // 떠난 사용자를 위해 토큰을 더 만들지 않는다. 여기서 빠져나오면
+        // 스트림이 닫히고 슬롯도 finally에서 곧바로 반납된다.
+        if (aborted) break;
         if (chunk.text) {
           answer += chunk.text;
           send({ type: "delta", text: chunk.text });

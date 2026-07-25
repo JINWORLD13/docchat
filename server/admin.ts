@@ -32,25 +32,42 @@ function isLoopback(req: Request): boolean {
   return addr === "127.0.0.1" || addr === "::1" || addr === "::ffff:127.0.0.1";
 }
 
-export const requireAdmin: RequestHandler = (req, res, next) => {
-  if (ADMIN_TOKEN) {
-    if (!tokenMatches(req.get("x-admin-token"))) {
-      res.status(401).json({ error: "관리자 토큰이 필요합니다." });
+// 위 두 단계를 그대로 쓰되 거절 문구만 용도에 맞게 바꾼다.
+// 문구가 중요한 이유는, 막혔을 때 무엇을 해야 하는지가 화면에 그대로 뜨기 때문이다.
+function protect(what: string): RequestHandler {
+  return (req, res, next) => {
+    if (ADMIN_TOKEN) {
+      if (!tokenMatches(req.get("x-admin-token"))) {
+        res.status(401).json({ error: `${what}에는 관리자 토큰이 필요합니다.` });
+        return;
+      }
+      next();
+      return;
+    }
+
+    if (!isLoopback(req)) {
+      res.status(403).json({
+        error: `${what}은(는) 로컬에서만 할 수 있습니다. 원격에서 쓰려면 ADMIN_TOKEN을 설정하세요.`,
+      });
       return;
     }
     next();
-    return;
-  }
+  };
+}
 
-  if (!isLoopback(req)) {
-    res.status(403).json({
-      error:
-        "관리자 기능은 로컬에서만 사용할 수 있습니다. 원격에서 쓰려면 ADMIN_TOKEN을 설정하세요.",
-    });
-    return;
-  }
-  next();
-};
+export const requireAdmin = protect("관리자 기능");
+
+// 문서 추가·수정·삭제 보호.
+//
+// 읽기는 열어두고 쓰기만 막는 이유: 이 엔드포인트들은 열려 있으면 단순히
+// 데이터가 바뀌는 정도가 아니다. DELETE 한 번이면 코퍼스 전체가 사라지고,
+// POST 한 번이 임베딩 API를 최대 30회 호출하며 쓰기 풀(max 5) 커넥션을
+// 300번의 insert 동안 붙잡는다. 그 쓰기 풀은 질문 로그가 쓰는 곳이라,
+// 방어 레이어가 지키겠다고 한 경로를 업로드 몇 번으로 무너뜨릴 수 있었다.
+//
+// 관리자 스위치와 같은 규칙을 쓴다 — 로컬 데모는 설정 없이 그대로 돌고,
+// 배포하면 토큰 없이는 아무것도 못 바꾼다.
+export const requireWriteAccess = protect("문서 변경");
 
 export function adminMode(): "token" | "loopback-only" {
   return ADMIN_TOKEN ? "token" : "loopback-only";

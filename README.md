@@ -8,12 +8,10 @@ TypeScript, React, Express, PostgreSQL(pgvector), Socket.IO, Gemini API로 만�
 
 한 서버가 두 종류의 실시간을 다룹니다 — 답변 토큰은 SSE(한 방향), 채팅은
 WebSocket(양방향 1:N). 왜 나누지 않고 한 프로세스에 뒀는지는
-[STUDY-REALTIME.md](STUDY-REALTIME.md)에 정리했습니다.
+[PORTFOLIO.md](PORTFOLIO.md)에 정리했습니다.
 
 > 함께 보기 — [PORTFOLIO.md](PORTFOLIO.md): 기술 선택과 그 이유 ·
-> [RELIABILITY.md](RELIABILITY.md): 부하·장애 대응 설계와 측정값 ·
-> [STUDY.md](STUDY.md): 문서 Q&A 흐름별 상세 설명 ·
-> [STUDY-REALTIME.md](STUDY-REALTIME.md): 실시간 채팅 흐름별 상세 설명
+> [RELIABILITY.md](RELIABILITY.md): 부하·장애 대응 설계와 측정값
 
 ![답변과 근거 출처](docs/demo-answer.png)
 
@@ -57,7 +55,7 @@ LLM API를 한 번 호출해서 답을 받는 것과, 믿고 쓸 수 있는 AI �
 문서에 없는 질문에 그럴듯한 답을 지어내는 게 RAG의 가장 나쁜 실패라고 봤습니다.
 검색된 최고 유사도가 임계값(기본 0.62)보다 낮으면 LLM을 아예 호출하지 않고
 거절합니다. 헛소리도 막고 토큰도 아낍니다. 임계값은 그냥 찍은 게 아니라 샘플
-문서로 관련 질문(유사도 0.66~0.74)과 무관 질문(0.52~0.59)을 재보고 그 사이로
+문서로 관련 질문(유사도 0.66~0.74)과 무관 질문(0.53~0.59)을 재보고 그 사이로
 잡았습니다. 문서가 바뀌면 질문마다 `query_logs`에 남는 유사도를 보고 다시
 맞춥니다.
 
@@ -85,9 +83,10 @@ HNSW 인덱스로 검색합니다. 문서 메타데이터랑 벡터를 한 DB에
 ### 과부하와 장애를 견디는 설계
 
 Rate Limiter(Token Bucket), Admission Control(동시 상한 + 대기 데드라인),
-Bulkhead(읽기/쓰기 풀 격리), Circuit Breaker, Graceful Degradation을 직접
-구현했습니다. 병목은 추측하지 않고 부하를 걸어 측정했고(LLM이 아니라 DB 풀이었습니다),
-각 레이어의 동작을 단위 테스트로 고정했습니다. (`cd server && npm test` — 48개)
+Bulkhead(읽기·쓰기·미디어 세 풀로 격리 — 이미지 조회가 질문 응답을 굶기지 않게),
+Circuit Breaker, Graceful Degradation을 직접 구현했습니다. 병목은 추측하지 않고 부하를
+걸어 측정했고(LLM이 아니라 DB 풀이었습니다), 각 레이어의 동작을 단위 테스트로
+고정했습니다. (`cd server && npm test` — 61개)
 
 설계 근거·대안 비교·측정값은 [RELIABILITY.md](RELIABILITY.md)에 정리했습니다.
 
@@ -178,13 +177,22 @@ npm install
 npm run dev
 ```
 
+서버가 떴는지는 `curl http://localhost:4000/api/health` → `{"ok":true}`로 확인합니다.
+
 3. 프론트
 
 ```bash
 cd web
+cp .env.example .env   # 선택 — 로컬 데모는 비워둔 채로 그대로 동작합니다
 npm install
 npm run dev   # http://localhost:5173
 ```
+
+프런트 환경 변수는 `web/.env.example`에 있습니다. Vite는 `web/` 아래의 `.env*`만
+읽으므로, 서버 쪽 `.env`에 `VITE_`로 시작하는 값을 넣어도 빌드에 반영되지 않습니다.
+지금 쓰는 값은 대시보드의 장애 주입 버튼용 `VITE_ADMIN_TOKEN` 하나뿐이고, 로컬은
+루프백이라 비워두면 됩니다. 이 값을 채워 배포하면 번들에 평문으로 들어가 방문자
+누구나 읽을 수 있다는 점만 유의합니다(파일의 주의 사항 참고).
 
 `sample-docs/`의 문서 두 개를 올리고 이렇게 물어보면 됩니다.
 
@@ -206,9 +214,10 @@ docker exec -i docchat-db psql -U postgres -d docchat < server/schema.sql
 
 ```
 server/
-  index.ts            Express 앱 + Socket.IO 부착, /api/metrics, 에러 미들웨어
+  index.ts            Express 앱 + Socket.IO 부착, /api/health, /api/metrics,
+                      에러 미들웨어
   types.ts            SSE 이벤트 유니온, /api/metrics 응답 타입 (한 곳에서 관리)
-  db.ts               pg 커넥션 풀 — 읽기/쓰기 분리 (Bulkhead)
+  db.ts               pg 커넥션 풀 — 읽기·쓰기·미디어 세 개로 분리 (Bulkhead)
   gemini.ts           임베딩 / 스트리밍 생성 / 지수 백오프 재시도
   chunk.ts            겹침 청킹
   cache.ts            질문 임베딩 캐시 (TTL)
@@ -232,8 +241,9 @@ server/
   scripts/            부하 테스트, 캐시 벤치, 방어 레이어 시연
   schema.sql
   tsconfig.json       빌드 없음 — Node가 타입을 벗겨 실행, tsc는 검사만
-  *.test.ts           단위 테스트 48개
-                      (청킹·token bucket·rate limit·breaker·admission·rooms)
+  *.test.ts           단위 테스트 61개
+                      (청킹·token bucket·rate limit·breaker·admission·rooms
+                       ·imagetype)
 web/
   src/
     types.ts          서버와 맞춘 계약 (문서·SSE 이벤트·metrics)
