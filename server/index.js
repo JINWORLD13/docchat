@@ -9,10 +9,15 @@ import { rateLimit, rateLimitStats } from "./ratelimit.js";
 import { admissionStats } from "./admission.js";
 import { breakerState, reset as resetBreaker } from "./breaker.js";
 import { faults } from "./faults.js";
+import { requireAdmin, adminMode } from "./admin.js";
 
 const app = express();
-// req.ip를 프록시(배포 시 로드밸런서) 뒤에서도 실제 클라이언트 IP로 잡게 한다.
-app.set("trust proxy", true);
+// 프록시(배포 시 로드밸런서) 뒤에서 req.ip가 실제 클라이언트 IP를 가리키게 한다.
+// true(모든 홉 신뢰)가 아니라 1인 이유: 전부 신뢰하면 클라이언트가
+// X-Forwarded-For 헤더를 직접 넣어 req.ip를 조작할 수 있고, IP별로 버킷을
+// 나누는 rate limiter가 "요청마다 새 IP"로 통째로 우회된다.
+// 신뢰 범위를 우리 인프라(LB 1홉)로 못박아야 그 뒤 값이 스푸핑되지 않는다.
+app.set("trust proxy", 1);
 app.use(cors());
 app.use(express.json());
 
@@ -46,11 +51,12 @@ app.get("/api/metrics", (req, res) => {
 
 // --- 데모용 관리자 엔드포인트 ---
 // 대시보드 버튼이 부른다. 상황을 주입하고, 방어 레이어가 반응하는 걸 실시간으로 본다.
-app.post("/api/admin/fault", (req, res) => {
+// 고의로 장애를 일으키는 스위치라 반드시 requireAdmin으로 보호한다(admin.js 참고).
+app.post("/api/admin/fault", requireAdmin, (req, res) => {
   if (typeof req.body?.llmFail === "boolean") faults.llmFail = req.body.llmFail;
   res.json({ ok: true, faults });
 });
-app.post("/api/admin/reset", (req, res) => {
+app.post("/api/admin/reset", requireAdmin, (req, res) => {
   faults.llmFail = false;
   resetBreaker();
   res.json({ ok: true });
@@ -71,6 +77,7 @@ app.use((err, req, res, next) => {
 const port = process.env.PORT || 4000;
 app.listen(port, () => {
   console.log(`server: http://localhost:${port}`);
+  console.log(`admin 엔드포인트 보호: ${adminMode()}`);
   if (!process.env.GEMINI_API_KEY) {
     console.warn("GEMINI_API_KEY가 설정되지 않았습니다. .env 파일을 확인하세요.");
   }

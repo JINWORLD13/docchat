@@ -3,6 +3,25 @@
 문서(txt, md)를 업로드하면 그 문서 내용을 근거로만 답변하는 RAG 챗봇입니다.
 React, Express, PostgreSQL(pgvector), Gemini API로 만들었습니다.
 
+> 함께 보기 — [PORTFOLIO.md](PORTFOLIO.md): 기술 선택과 그 이유 ·
+> [RELIABILITY.md](RELIABILITY.md): 부하·장애 대응 설계와 측정값 ·
+> [STUDY.md](STUDY.md): 흐름별 상세 설명
+
+![답변과 근거 출처](docs/demo-answer.png)
+
+답변 위에 참고한 문서와 유사도가 뜨고, 본문의 [1], [2]가 그 출처와 연결됩니다.
+
+![문서에 없으면 거절](docs/demo-refusal.png)
+
+문서에 없는 내용이면 지어내지 않고 거절합니다. 이때 LLM은 호출조차 하지 않습니다.
+
+![LLM 장애 주입 시 대시보드](docs/demo-dashboard-breaker.png)
+
+대시보드에서 트래픽 폭주와 LLM 장애를 직접 주입하고, 방어 레이어(Rate Limiter,
+Admission Control, Bulkhead, Circuit Breaker)가 반응하는 걸 실시간으로 볼 수
+있습니다. 위 화면은 LLM이 완전히 죽은 상태 — 회로가 열렸고, 20건 중 하드 에러는
+0이며 사용자는 출처를 계속 받습니다. 설계 근거는 [RELIABILITY.md](RELIABILITY.md).
+
 ## 왜 만들었나
 
 LLM API를 한 번 호출해서 답을 받는 것과, 믿고 쓸 수 있는 AI 기능을 만드는 것은
@@ -53,7 +72,16 @@ HNSW 인덱스로 검색합니다. 문서 메타데이터랑 벡터를 한 DB에
 ### 겹치는 청킹
 
 청크 경계에서 문장이 잘리면 검색에 안 걸릴 수 있어서 어절 200개 단위로 40개씩
-겹치게 자릅니다. 순수 함수라 테스트를 붙여놨습니다. (`cd server && npm test`)
+겹치게 자릅니다. 순수 함수라 테스트를 붙여놨습니다.
+
+### 과부하와 장애를 견디는 설계
+
+Rate Limiter(Token Bucket), Admission Control(동시 상한 + 대기 데드라인),
+Bulkhead(읽기/쓰기 풀 격리), Circuit Breaker, Graceful Degradation을 직접
+구현했습니다. 병목은 추측하지 않고 부하를 걸어 측정했고(LLM이 아니라 DB 풀이었습니다),
+각 레이어의 동작을 단위 테스트로 고정했습니다. (`cd server && npm test` — 19개)
+
+설계 근거·대안 비교·측정값은 [RELIABILITY.md](RELIABILITY.md)에 정리했습니다.
 
 ### 스트리밍과 일시 오류 대응
 
@@ -111,20 +139,30 @@ docker exec -i docchat-db psql -U postgres -d docchat < server/schema.sql
 
 ```
 server/
-  index.js            Express 앱, 에러 미들웨어
-  db.js               pg 커넥션 풀
-  gemini.js           임베딩 / 스트리밍 생성 / 재시도
-  chunk.js            겹침 청킹 (+ chunk.test.js)
+  index.js            Express 앱, /api/metrics, 에러 미들웨어
+  db.js               pg 커넥션 풀 — 읽기/쓰기 분리 (Bulkhead)
+  gemini.js           임베딩 / 스트리밍 생성 / 지수 백오프 재시도
+  chunk.js            겹침 청킹
+  cache.js            질문 임베딩 캐시 (TTL)
+  ratelimit.js        사용자별 Token Bucket 요청 제한
+  admission.js        동시 처리 상한 + 대기 데드라인 (load shedding)
+  breaker.js          LLM 회로 차단기
+  admin.js            장애 주입 엔드포인트 보호 (토큰 / 루프백)
+  faults.js           런타임 장애 주입 스위치 (데모용)
   routes/
     documents.js      업로드, 목록, 원문 열람(GET), 수정(PUT), 삭제
-    chat.js           검색 → 거절 게이트 → SSE 스트리밍 → 로깅
+    chat.js           검색 → 거절 게이트 → 회로 확인 → SSE 스트리밍 → 로깅
+  scripts/            부하 테스트, 캐시 벤치, 방어 레이어 시연
   schema.sql
+  *.test.js           단위 테스트 19개 (청킹·rate limit·breaker·admission)
 web/
   src/
     api.js            fetch + SSE 파싱
     App.jsx
-    components/       Sidebar(업로드/목록) / Chat / Message(근거 표시) / DocModal(열람·수정 팝업)
+    components/       Sidebar(업로드/목록) / Chat / Message(근거 표시)
+                      DocModal(열람·수정 팝업) / Dashboard(부하·장애 대시보드)
 sample-docs/          데모용 가상 쇼핑몰 문서
+docs/                 README·포트폴리오용 스크린샷
 docker-compose.yml    pgvector 포함 Postgres
 ```
 
@@ -140,5 +178,7 @@ docker-compose.yml    pgvector 포함 Postgres
   검색을 다음에 시도해보고 싶습니다.
 - 거절 임계값을 로그를 보며 수동으로 조정하고 있는데, 평가용 질문 세트를
   만들어서 자동으로 측정하는 게 다음 목표입니다.
+- 클라이언트가 응답 도중 떠나도 서버는 LLM 스트림을 끝까지 소비합니다.
+  연결 종료(close) 이벤트를 감지해 생성을 중단하는 것이 다음 개선 후보입니다.
 - 배포는 Neon(pgvector 지원) + Render + Netlify 무료 티어 조합으로 올릴
   예정입니다.

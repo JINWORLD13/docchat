@@ -46,18 +46,38 @@ export async function fetchMetrics() {
   return res.json();
 }
 
+// 관리자 엔드포인트는 서버에서 보호된다(server/admin.js).
+// 로컬 개발은 루프백이라 토큰 없이 통과한다.
+// 주의: VITE_* 값은 빌드 산출물(JS 번들)에 평문으로 들어가 방문자 누구나
+// 읽을 수 있다. 그래서 VITE_ADMIN_TOKEN을 넣는 배포는 "장애 주입 데모를
+// 방문자에게 공개"하는 선택이다. 외부에 잠그고 싶으면 프론트에는 토큰을
+// 넣지 말고(버튼은 막힘), 필요할 때 서버 토큰으로 직접(curl) 호출한다.
+const ADMIN_TOKEN = import.meta.env.VITE_ADMIN_TOKEN || "";
+
+function adminHeaders(extra = {}) {
+  return ADMIN_TOKEN ? { ...extra, "x-admin-token": ADMIN_TOKEN } : extra;
+}
+
+async function postAdmin(path, body) {
+  const res = await fetch(`${BASE}${path}`, {
+    method: "POST",
+    headers: adminHeaders(body ? { "Content-Type": "application/json" } : {}),
+    body: body ? JSON.stringify(body) : undefined,
+  });
+  if (!res.ok) {
+    const data = await res.json().catch(() => ({}));
+    throw new Error(data.error || "관리자 요청에 실패했습니다.");
+  }
+}
+
 // LLM 장애 주입 on/off
 export async function setFault(llmFail) {
-  await fetch(`${BASE}/admin/fault`, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ llmFail }),
-  });
+  await postAdmin("/admin/fault", { llmFail });
 }
 
 // 회로·장애 상태 초기화
 export async function resetDefense() {
-  await fetch(`${BASE}/admin/reset`, { method: "POST" });
+  await postAdmin("/admin/reset");
 }
 
 // 동시 count개의 질문을 쏴서(트래픽 폭주 흉내) 상태별로 집계한다.

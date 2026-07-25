@@ -16,9 +16,13 @@ const EMBED_BATCH = 10;
 
 // 원문 텍스트를 청크로 나누고 각 청크를 임베딩한다.
 // 업로드와 수정이 같은 과정을 거치므로 함수로 묶었다.
+// 크기 상한 검사는 임베딩 전에 한다 — 초과 문서를 전부 임베딩하고 나서
+// 버리면 API 호출(무료 티어 rate limit 포함)만 낭비하기 때문.
 // 무료 티어 rate limit 때문에 임베딩은 한 번에 몰지 않고 배치로 나눠 보낸다.
 async function chunkAndEmbed(text) {
   const chunks = chunkText(text);
+  if (chunks.length > MAX_CHUNKS) return { tooLarge: true, chunks, embeddings: [] };
+
   const embeddings = [];
   for (let i = 0; i < chunks.length; i += EMBED_BATCH) {
     embeddings.push(...(await embedTexts(chunks.slice(i, i + EMBED_BATCH))));
@@ -81,8 +85,8 @@ router.post("/", upload.single("file"), async (req, res) => {
   }
 
   try {
-    const { chunks, embeddings } = await chunkAndEmbed(text);
-    if (chunks.length > MAX_CHUNKS) {
+    const { chunks, embeddings, tooLarge } = await chunkAndEmbed(text);
+    if (tooLarge) {
       return res.status(400).json({ error: "문서가 너무 큽니다. 나눠서 업로드해주세요." });
     }
 
@@ -121,8 +125,8 @@ router.put("/:id", async (req, res) => {
   }
 
   try {
-    const { chunks, embeddings } = await chunkAndEmbed(text);
-    if (chunks.length > MAX_CHUNKS) {
+    const { chunks, embeddings, tooLarge } = await chunkAndEmbed(text);
+    if (tooLarge) {
       return res.status(400).json({ error: "문서가 너무 큽니다." });
     }
 

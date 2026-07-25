@@ -56,13 +56,23 @@ export default function Dashboard() {
 
   async function toggleFault() {
     const next = !faultOn;
-    await setFault(next);
+    try {
+      await setFault(next);
+    } catch (e) {
+      addLog(e.message, "danger");
+      return;
+    }
     setFaultOn(next);
     addLog(next ? "LLM 장애 주입 ON — 생성이 실패하기 시작" : "LLM 장애 해제", next ? "danger" : "ok");
   }
 
   async function handleReset() {
-    await resetDefense();
+    try {
+      await resetDefense();
+    } catch (e) {
+      addLog(e.message, "danger");
+      return;
+    }
     setFaultOn(false);
     addLog("리셋 — 장애 해제 + 회로 초기화", "info");
   }
@@ -98,9 +108,15 @@ export default function Dashboard() {
         <Arrow />
         <Layer
           name="Admission Control"
-          sub="동시 처리 상한"
+          sub="동시 처리 상한 + 대기 데드라인"
           active={(ad?.queued ?? 0) > 0}
-          stat={`처리중 ${ad?.inFlight ?? 0}/${ad?.maxInFlight ?? "-"} · 대기 ${ad?.queued ?? 0}`}
+          stat={
+            `처리중 ${ad?.inFlight ?? 0}/${ad?.maxInFlight ?? "-"} · 대기 ${ad?.queued ?? 0}` +
+            // 큐가 꽉 차 즉시 튕긴 것과, 기다리다 데드라인에 포기한 것을 구분해 보여준다.
+            // 둘은 원인이 다르다 — 전자는 지속 과부하, 후자는 처리가 느려졌다는 신호.
+            ((ad?.rejected ?? 0) > 0 ? ` · 거절 ${ad.rejected}` : "") +
+            ((ad?.timedOut ?? 0) > 0 ? ` · 대기포기 ${ad.timedOut}` : "")
+          }
         />
         <Arrow />
         <Layer
