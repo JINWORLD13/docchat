@@ -35,6 +35,30 @@ export const writePool = new pg.Pool({ ...common, max: Number(process.env.PG_WRI
 // 풀이 클 필요가 없고, 오히려 작게 잡아 폭주 시 상한을 못박는 게 낫다.
 export const mediaPool = new pg.Pool({ ...common, max: Number(process.env.PG_MEDIA_MAX || 4) });
 
+// --- 유휴 커넥션이 끊길 때 프로세스가 죽지 않게 ---
+//
+// pg는 "쉬고 있던 커넥션이 끊겼다"는 사실을 풀의 'error' 이벤트로 알린다.
+// 여기에 리스너가 없으면 Node는 처리되지 않은 'error'로 보고 프로세스를 그대로
+// 죽인다. 실제로 그랬다 — 절전에서 깨어난 뒤 read EADDRNOTAVAIL 하나로 서버가
+// 내려갔고, DB를 쓰지도 않는 실시간 채팅까지 함께 끊겼다. 방어 레이어를 네 겹
+// 쌓아둔 서버가 쿼리도 아닌 유휴 소켓 하나에 전체가 무너지는 셈이다.
+//
+// 원격 DB(Neon)라 이 상황은 예외가 아니라 일상이다. 노트북 절전 복귀, Wi-Fi
+// 전환, VPN, 서버 쪽의 유휴 연결 종료 — 전부 여기로 온다.
+//
+// 이 이벤트는 "지금 이 쿼리가 실패했다"는 뜻이 아니다. 풀은 끊긴 클라이언트를
+// 스스로 버리고 다음 요청에 새로 연결한다. 그래서 여기서 할 일은 두 가지뿐이다:
+// 죽지 않는 것, 그리고 조용히 넘기지 않는 것(무슨 일이 있었는지는 남긴다).
+function keepPoolAlive(name: string, pool: pg.Pool): void {
+  pool.on("error", (err: Error) => {
+    console.error(`[${name}] 유휴 커넥션 오류 — 버리고 계속합니다:`, err.message);
+  });
+}
+
+keepPoolAlive("readPool", readPool);
+keepPoolAlive("writePool", writePool);
+keepPoolAlive("mediaPool", mediaPool);
+
 // 대시보드에 그대로 실어 보내는 풀 상태.
 export interface PoolStats {
   total: number;
