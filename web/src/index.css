@@ -867,6 +867,39 @@ body {
   padding: 4px 2px;
 }
 
+.roomlist-row {
+  display: flex;
+  align-items: center;
+  gap: 2px;
+}
+
+.roomlist-row .roomlist-item {
+  flex: 1;
+  min-width: 0; /* 방 이름이 길어도 삭제 버튼을 밀어내지 않게 */
+}
+
+/* 방 삭제(방장에게만 보인다).
+   아이콘을 글자(×)가 아니라 svg로 그리는 이유는 아래 .attach와 같다. */
+.roomlist-del {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 26px;
+  height: 26px;
+  flex-shrink: 0;
+  padding: 0;
+  border: none;
+  border-radius: 8px;
+  background: none;
+  color: #c0c6cf;
+  cursor: pointer;
+}
+
+.roomlist-del:hover {
+  background: #fee2e2;
+  color: #dc2626;
+}
+
 .roomlist-item {
   display: flex;
   align-items: center;
@@ -1024,6 +1057,50 @@ body {
   margin: 0 0 2px 4px;
 }
 
+/* 말풍선 + 취소 버튼 한 줄. */
+.bubble-line {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  max-width: 100%;
+}
+
+/* 보낸 것 취소(내 메시지에만 붙는다).
+   마우스가 올라간 줄에서만 보인다 — 지나간 대화마다 ×가 떠 있으면 시끄럽다.
+   hover가 없는 기기(터치)에서는 방법이 없으니 항상 보이게 둔다. 그래서
+   숨기는 규칙을 hover가 되는 환경에만 건다. */
+.msg-cancel {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 22px;
+  height: 22px;
+  flex-shrink: 0;
+  padding: 0;
+  border: none;
+  border-radius: 50%;
+  background: none;
+  color: #b6bcc6;
+  cursor: pointer;
+}
+
+.msg-cancel:hover {
+  background: #fee2e2;
+  color: #dc2626;
+}
+
+@media (hover: hover) {
+  .msg-cancel {
+    opacity: 0;
+  }
+
+  /* 키보드로 접근할 때도 보여야 한다 (:focus-visible) */
+  .bubble-line:hover .msg-cancel,
+  .msg-cancel:focus-visible {
+    opacity: 1;
+  }
+}
+
 .bubble {
   display: flex;
   align-items: flex-end;
@@ -1104,6 +1181,19 @@ body {
   flex-shrink: 0;
 }
 
+/* 오류가 아닌 알림(예: 방이 삭제됐다). 방을 지운 사람도 같은 문구를 보는데,
+   자기가 누른 일까지 빨간 경고로 보여줄 이유는 없다. */
+.chat-notice {
+  background: #eef2ff;
+  color: #3f4a8a;
+  font-size: 13px;
+  text-align: center;
+  padding: 8px;
+  border-radius: 8px;
+  cursor: pointer;
+  flex-shrink: 0;
+}
+
 /* ---------- 이미지 ---------- */
 
 .image-wrap {
@@ -1137,26 +1227,53 @@ body {
   display: block;
 }
 
-.attach {
+/* 이미지 첨부 버튼.
+   선택자를 .attach가 아니라 .send-bar .attach로 쓴다. 이 버튼도 .send-bar
+   안의 button이라 .send-bar button 규칙(0,1,1)이 .attach(0,1,0)를 이긴다 —
+   거기서 오는 padding: 0 20px이 문제였다. width가 40px인데 좌우 패딩이 40px,
+   box-sizing: border-box라 내용이 들어갈 칸이 0px이 된다. 그러면 아이콘은
+   "칸 안에서 가운데"가 아니라 넘친 채로 놓여서, 가운데에서 살짝 밀린다.
+   그래서 패딩을 0으로 돌리고 flex로 정중앙에 둔다.
+
+   아이콘을 글자(＋)가 아니라 svg로 그리는 이유도 같은 문제의 다른 절반이다.
+   글자는 폰트가 정한 여백(좌우 side bearing)과 기준선을 따라 놓이므로,
+   상자를 정확히 가운데로 만들어도 글자 자체가 그 안에서 치우친다. 특히 ＋는
+   전각 문자라 폰트에 없으면 다른 폰트로 대체되면서 치우침이 더 커진다.
+   svg는 좌표로 그리니까 폰트와 무관하게 가운데가 가운데다. */
+.send-bar .attach {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
   width: 40px;
   flex-shrink: 0;
-  border: 1px solid #d6dae0;
-  border-radius: 10px;
-  background: #fff;
-  color: #6b7280;
-  font-size: 18px;
-  line-height: 1;
+  padding: 0;
+  color: #fff;
   cursor: pointer;
 }
 
-.attach:hover:not(:disabled) {
-  background: #f3f4f6;
-  color: #2563eb;
+.send-bar .attach:hover:not(:disabled) {
+  background: #1d4ed8;
 }
 
-.attach:disabled {
-  color: #cdd3dc;
+/* 올리는 동안. 회색 배경(.send-bar button:disabled) 위에 회색 아이콘을 두면
+   아무것도 안 보이므로 색은 흰색을 유지하고 투명도로만 알린다. */
+.send-bar .attach:disabled {
+  color: #fff;
   cursor: default;
+}
+
+.send-bar .attach.busy svg {
+  animation: attach-pulse 1s ease-in-out infinite;
+}
+
+@keyframes attach-pulse {
+  0%,
+  100% {
+    opacity: 0.35;
+  }
+  50% {
+    opacity: 1;
+  }
 }
 
 .chatroom.dragging {

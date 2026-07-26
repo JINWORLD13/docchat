@@ -88,6 +88,11 @@ export default function Room({ nickname, room, error, onDismissError, onLeave }:
     const onMessage = (msg: ChatMessage) => {
       setItems((prev) => [...prev, { kind: "msg", msg }]);
     };
+    // 누군가 자기 메시지를 취소했다. 시스템 알림은 남기지 않는다 —
+    // "○○ 님이 메시지를 삭제했습니다"는 지운 사실 자체를 다시 알리는 셈이다.
+    const onDeleted = (id: string) => {
+      setItems((prev) => prev.filter((it) => it.kind !== "msg" || it.msg.id !== id));
+    };
     const onSystem = (text: string) => {
       setItems((prev) => {
         // 연속으로 같은 시스템 알림(입장/퇴장)이 오면 하나만 보여준다.
@@ -106,6 +111,7 @@ export default function Room({ nickname, room, error, onDismissError, onLeave }:
 
     socket.on("history", onHistory);
     socket.on("message", onMessage);
+    socket.on("messageDeleted", onDeleted);
     socket.on("system", onSystem);
     socket.on("presence", onPresence);
     socket.on("typing", onTyping);
@@ -122,6 +128,7 @@ export default function Room({ nickname, room, error, onDismissError, onLeave }:
     return () => {
       socket.off("history", onHistory);
       socket.off("message", onMessage);
+      socket.off("messageDeleted", onDeleted);
       socket.off("system", onSystem);
       socket.off("presence", onPresence);
       socket.off("typing", onTyping);
@@ -141,6 +148,15 @@ export default function Room({ nickname, room, error, onDismissError, onLeave }:
     if (!text) return;
     socket.emit("message", { text });
     setInput("");
+  }
+
+  // 보낸 것 취소. 서버가 작성자를 다시 확인하므로(권한은 서버가 판단한다)
+  // 여기서 보내는 건 id뿐이고, 화면에서 지우는 것도 서버가 알려줄 때 한다 —
+  // 미리 지워두면 거절당했을 때 되살려야 한다.
+  function cancelMessage(msg: ChatMessage) {
+    const what = msg.kind === "image" ? "이 이미지를" : "이 메시지를";
+    if (!confirm(`${what} 취소할까요? 방에 있는 모두에게서 사라져요.`)) return;
+    socket.emit("deleteMessage", { messageId: msg.id });
   }
 
   function handleChange(value: string) {
@@ -227,7 +243,14 @@ export default function Room({ nickname, room, error, onDismissError, onLeave }:
                 {it.text}
               </div>
             ) : (
-              <Bubble key={it.msg.id} msg={it.msg} mine={it.msg.nickname === nickname} />
+              <Bubble
+                key={it.msg.id}
+                msg={it.msg}
+                mine={it.msg.nickname === nickname}
+                // 취소 버튼은 내 것에만 붙인다. 남의 메시지에 달아도 서버가
+                // 거절하지만, 눌러서 거절당할 버튼을 보여줄 이유가 없다.
+                onCancel={it.msg.nickname === nickname ? () => cancelMessage(it.msg) : undefined}
+              />
             )
           )}
           {typingUser && typingUser !== nickname && (
@@ -262,13 +285,24 @@ export default function Room({ nickname, room, error, onDismissError, onLeave }:
       <form className="send-bar" onSubmit={send}>
         <button
           type="button"
-          className="attach"
+          className={"attach" + (uploading ? " busy" : "")}
           onClick={() => fileRef.current?.click()}
           disabled={uploading}
-          title="이미지 보내기 (붙여넣기·끌어놓기도 됩니다)"
-          aria-label="이미지 보내기"
+          title={uploading ? "이미지 올리는 중…" : "이미지 보내기 (붙여넣기·끌어놓기도 됩니다)"}
+          aria-label={uploading ? "이미지 올리는 중" : "이미지 보내기"}
         >
-          {uploading ? "…" : "＋"}
+          {/* 글자 대신 svg. 폰트에 따라 글자가 상자 안에서 치우치는 걸 피한다
+              (index.css의 .send-bar .attach 주석). 올리는 동안에는 같은
+              아이콘을 깜빡여서 상자 크기가 흔들리지 않게 한다. */}
+          <svg viewBox="0 0 16 16" width="16" height="16" aria-hidden="true">
+            <path
+              d="M8 3.25v9.5M3.25 8h9.5"
+              fill="none"
+              stroke="currentColor"
+              strokeWidth="1.8"
+              strokeLinecap="round"
+            />
+          </svg>
         </button>
         <input
           type="file"
@@ -325,7 +359,15 @@ function displaySize(width: number, height: number): { width: number; height: nu
   };
 }
 
-function Bubble({ msg, mine }: { msg: ChatMessage; mine: boolean }) {
+function Bubble({
+  msg,
+  mine,
+  onCancel,
+}: {
+  msg: ChatMessage;
+  mine: boolean;
+  onCancel?: () => void;
+}) {
   const time = new Date(msg.ts).toLocaleTimeString("ko-KR", {
     hour: "2-digit",
     minute: "2-digit",
@@ -334,26 +376,43 @@ function Bubble({ msg, mine }: { msg: ChatMessage; mine: boolean }) {
   return (
     <div className={"bubble-row" + (mine ? " mine" : "")}>
       {!mine && <div className="bubble-nick">{msg.nickname}</div>}
-      {msg.kind === "image" ? (
-        <div className="image-wrap">
-          {/* 크기를 미리 박아두면 이미지가 도착하기 전에도 자리가 잡힌다 */}
-          <a
-            className="bubble-image"
-            href={msg.url}
-            target="_blank"
-            rel="noreferrer"
-            style={displaySize(msg.width, msg.height)}
-          >
-            <img src={msg.url} loading="lazy" alt={`${msg.nickname} 님이 보낸 이미지`} />
-          </a>
-          <span className="bubble-time">{time}</span>
-        </div>
-      ) : (
-        <div className="bubble">
-          <span className="bubble-text">{msg.text}</span>
-          <span className="bubble-time">{time}</span>
-        </div>
-      )}
+      {/* 말풍선과 취소 버튼을 한 줄로 묶는다. 내 메시지는 오른쪽에 붙으므로
+          버튼이 말풍선 왼쪽(대화창 가운데 쪽)에 놓인다. */}
+      <div className="bubble-line">
+        {onCancel && (
+          <button className="msg-cancel" onClick={onCancel} title="취소" aria-label="보낸 것 취소">
+            <svg viewBox="0 0 16 16" width="12" height="12" aria-hidden="true">
+              <path
+                d="M4 4l8 8M12 4l-8 8"
+                fill="none"
+                stroke="currentColor"
+                strokeWidth="1.8"
+                strokeLinecap="round"
+              />
+            </svg>
+          </button>
+        )}
+        {msg.kind === "image" ? (
+          <div className="image-wrap">
+            {/* 크기를 미리 박아두면 이미지가 도착하기 전에도 자리가 잡힌다 */}
+            <a
+              className="bubble-image"
+              href={msg.url}
+              target="_blank"
+              rel="noreferrer"
+              style={displaySize(msg.width, msg.height)}
+            >
+              <img src={msg.url} loading="lazy" alt={`${msg.nickname} 님이 보낸 이미지`} />
+            </a>
+            <span className="bubble-time">{time}</span>
+          </div>
+        ) : (
+          <div className="bubble">
+            <span className="bubble-text">{msg.text}</span>
+            <span className="bubble-time">{time}</span>
+          </div>
+        )}
+      </div>
     </div>
   );
 }

@@ -67,6 +67,22 @@ export function imageUrl(id: string): string {
   return `/api/chat/image/${id}`;
 }
 
+// imageUrl의 반대 방향. 주소 모양을 정하는 곳이 여기니까 되읽는 짝도 여기 둔다.
+// 메시지는 id가 아니라 완성된 url을 들고 있어서(그게 클라이언트에 나가는 값이다),
+// 지울 때 id를 되찾아야 한다.
+export function idFromUrl(url: string): string {
+  return url.slice(url.lastIndexOf("/") + 1);
+}
+
+// 보낸 사람이 취소한 이미지의 바이트를 지운다.
+//
+// 메시지만 지우고 행을 남기면 안 된다 — 주소를 한 번이라도 본 사람은 그대로
+// 계속 볼 수 있어서, "취소했다"는 말이 사실이 아니게 된다. 보관 기간 정리
+// (cleanupImages)에 맡기면 최대 24시간 뒤다.
+export async function deleteImage(id: string): Promise<void> {
+  await mediaPool.query("delete from chat_images where id = $1", [id]);
+}
+
 // --- 보관 기간 ---
 //
 // 이 테이블은 지우는 사람이 없으면 한 방향으로만 자란다. 게다가 방과 대화

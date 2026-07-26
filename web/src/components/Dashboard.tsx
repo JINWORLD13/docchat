@@ -17,16 +17,44 @@ interface LogEntry {
 
 let logSeq = 0;
 
+// --- 탭을 옮겨도 남아야 하는 것 ---
+//
+// 이 화면이 보여주는 건 "지금 값"이 아니라 "값이 어떻게 변했는가"다. 그런데 그
+// 기록(이벤트 로그)과 비교 기준(직전 스냅샷)이 컴포넌트 안에 있으면 다른 탭을
+// 누르는 순간 함께 사라진다. 장애를 주입해둔 채 탭을 옮겼다 오면 서버는 여전히
+// 장애 상태인데 화면은 "버튼을 눌러 상황을 주입해보세요"가 된다 — 아무 일도
+// 없었던 것과 구분이 안 되는, 이 화면이 가장 하면 안 되는 표시다.
+// (지표 자체는 서버에 있으니 폴링이 1초 안에 다시 채운다)
+//
+// 컴포넌트 바깥에 두는 이유는 언마운트를 견뎌야 하기 때문이고, 그래서 아래
+// pushLog는 화면이 없는 동안 도착한 결과(진행 중이던 폭주의 결과 로그)도
+// 기록한다 — 돌아오면 그 줄이 로그에 남아 있다.
+let logStore: LogEntry[] = [];
+let lastMetrics: MetricsResponse | null = null;
+
+function pushLog(text: string, kind: LogKind): LogEntry[] {
+  logSeq += 1;
+  logStore = [
+    { id: logSeq, t: new Date().toLocaleTimeString(), text, kind },
+    ...logStore,
+  ].slice(0, 30);
+  return logStore;
+}
+
+// 관측이 끊겼던 구간을 로그에 남길 때 쓰는 문구.
+// 같은 줄이 연달아 쌓이지 않게 맨 위와 비교하는 데도 쓴다 — StrictMode는
+// 개발 모드에서 effect를 두 번 돌리므로 그냥 넣으면 두 줄이 된다.
+const RESUMED = "관측 재개 — 다른 탭에 있는 동안의 변화는 기록되지 않았습니다";
+
 export default function Dashboard() {
   const [m, setM] = useState<MetricsResponse | null>(null);
   const [faultOn, setFaultOn] = useState(false);
-  const [log, setLog] = useState<LogEntry[]>([]);
+  const [log, setLog] = useState<LogEntry[]>(logStore);
   const [busy, setBusy] = useState(false);
   // 서버에 닿지 못하는 상태. null이면 정상.
   const [offline, setOffline] = useState<string | null>(null);
-  const prev = useRef<MetricsResponse | null>(null);
   // 폴링이 겹치는 걸 막는다. 응답이 1초보다 오래 걸리면 요청이 쌓이고,
-  // 늦게 온 응답이 먼저 온 응답을 덮어써 prev가 뒤죽박죽이 된다 —
+  // 늦게 온 응답이 먼저 온 응답을 덮어써 비교 기준(lastMetrics)이 뒤죽박죽이 된다 —
   // 하필 그 상황(서버가 느려진 상황)이 회로 전이를 정확히 봐야 할 때다.
   const inFlight = useRef(false);
   // 장애 토글 직후 잠깐은 폴링이 버튼 상태를 되돌리지 못하게 막는다.
@@ -34,14 +62,16 @@ export default function Dashboard() {
   const holdFaultUntil = useRef(0);
 
   function addLog(text: string, kind: LogKind = "info"): void {
-    logSeq += 1;
-    setLog((l) =>
-      [{ id: logSeq, t: new Date().toLocaleTimeString(), text, kind }, ...l].slice(0, 30)
-    );
+    setLog(pushLog(text, kind));
   }
 
   // 1초마다 metrics 폴링 + 상태 전이 감지
   useEffect(() => {
+    // 관측이 멈췄던 구간을 눈에 보이게 표시한다. 이 화면은 "안 보고 있던 사이"와
+    // "아무 일도 없었던 사이"를 절대 같게 보여주면 안 된다.
+    // lastMetrics가 있다는 건 전에 한 번 관측했다는 뜻이다(= 첫 방문이 아니다).
+    if (lastMetrics && logStore[0]?.text !== RESUMED) addLog(RESUMED, "info");
+
     let alive = true;
     const tick = async (): Promise<void> => {
       if (inFlight.current) return;
@@ -49,14 +79,16 @@ export default function Dashboard() {
       try {
         const data = await fetchMetrics();
         if (!alive) return;
-        const p = prev.current;
+        // 비교 기준도 컴포넌트 바깥에 있다. 그래서 탭을 옮겨 있는 동안 회로가
+        // 열렸다면, 돌아온 뒤 첫 폴링이 그 전이를 잡아낸다 (시각은 돌아온 시각).
+        const p = lastMetrics;
         if (p && !p.breaker.open && data.breaker.open) {
           addLog("Circuit Breaker 열림 — LLM 연속 실패 감지", "danger");
         }
         if (p && p.breaker.open && !data.breaker.open) {
           addLog("Circuit Breaker 닫힘 — 정상 복구", "ok");
         }
-        prev.current = data;
+        lastMetrics = data;
         setM(data);
         if (Date.now() >= holdFaultUntil.current) setFaultOn(data.faults.llmFail);
         setOffline((was) => {

@@ -24,7 +24,7 @@ import type {
   SocketData,
   TextMessage,
 } from "./types.ts";
-import { describeImage, imageUrl } from "../images.ts";
+import { describeImage, imageUrl, idFromUrl, deleteImage } from "../images.ts";
 import {
   addUser,
   removeUser,
@@ -34,6 +34,9 @@ import {
   roomList,
   canJoin,
   sweepRooms,
+  deleteRoom,
+  removeMessage,
+  imageInUse,
 } from "./rooms.ts";
 import { allowMessage, allowAction, addSocket, removeSocket } from "./ratelimit.ts";
 import { readString } from "./payload.ts";
@@ -88,6 +91,22 @@ export function attachRealtime(httpServer: HttpServer): ChatServer {
     if (nickname) socket.to(room).emit("system", `${nickname} 님이 나갔어요`);
     socket.data.room = undefined;
     return true;
+  };
+
+  // 지금 이 방에 들어가 있는 소켓들.
+  // adapter가 들고 있는 socket id로 실제 소켓 객체를 찾는다. socketsLeave()처럼
+  // 한 번에 내보내는 API도 있지만, 그건 소켓에 붙여둔 socket.data.room을
+  // 건드리지 않는다 — 그 값이 남으면 아래 deleteRoom에서 문제가 된다.
+  // (방 상태를 메모리에 두는 것과 같은 전제: 서버 한 대)
+  const roomMembers = (roomName: string): ChatSocket[] => {
+    const ids = io.sockets.adapter.rooms.get(roomName);
+    if (!ids) return [];
+    const found: ChatSocket[] = [];
+    for (const id of ids) {
+      const member = io.sockets.sockets.get(id);
+      if (member) found.push(member);
+    }
+    return found;
   };
 
   // 방 청소 타이머. unref()라 이 타이머 때문에 프로세스가 살아 있진 않는다.
@@ -182,6 +201,46 @@ export function attachRealtime(httpServer: HttpServer): ChatServer {
       if (leaveCurrentRoom(socket)) broadcastRooms();
     });
 
+    // 방 삭제. 만든 사람만 지울 수 있다(권한 판단은 rooms.ts).
+    //
+    // 방은 마지막 사람이 나가면 알아서 정리되지만, 대화가 오간 방은 유예 시간
+    // 동안 목록에 남는다. 잘못 만든 이름이나 다 끝난 방을 바로 치우는 수단이 없으면
+    // 로비가 지저분해지고, 지우고 싶은 대화가 30분간 남는다.
+    socket.on("deleteRoom", (payload) => {
+      const { nickname } = socket.data;
+      if (!nickname) {
+        socket.emit("chatError", "먼저 닉네임을 정해주세요.");
+        return;
+      }
+      // join과 같은 성격의 1:N 증폭이다(목록이 전원에게 다시 나간다).
+      if (!allowedAction()) return;
+
+      const roomName = readString(payload, "room").trim().slice(0, MAX_ROOM);
+      if (!roomName) return;
+
+      const result = deleteRoom(roomName, nickname);
+      if (result === "notfound") {
+        socket.emit("chatError", "이미 사라진 방이에요.");
+        return;
+      }
+      if (result === "denied") {
+        socket.emit("chatError", "방을 만든 사람만 지울 수 있어요.");
+        return;
+      }
+
+      // 방에 있던 사람들(지운 사람 포함)을 로비로 내보낸다.
+      //
+      // socket.data.room을 지우는 게 핵심이다. 남겨두면 그 사람이 보내는 다음
+      // 메시지가 publish → addMessage → getRoom을 타고 지운 방을 되살린다.
+      // 그것도 방장 없는(owner: "") 방으로 — 아무도 두 번 지울 수 없는 방이 된다.
+      for (const member of roomMembers(roomName)) {
+        member.data.room = undefined;
+        member.leave(roomName);
+        member.emit("roomClosed", roomName);
+      }
+      broadcastRooms();
+    });
+
     // 도배 제한을 태우고, 막혔으면 사용자에게 알린다.
     //
     // publish() 안이 아니라 그 앞에 따로 두는 이유는 이미지 때문이다.
@@ -265,6 +324,48 @@ export function attachRealtime(httpServer: HttpServer): ChatServer {
           socket.emit("chatError", "이미지를 보내지 못했어요.");
         }
       })();
+    });
+
+    // 보낸 것 취소: 내가 쓴 메시지·이미지를 방에서 없앤다.
+    //
+    // 이미지는 방 기록에서 빼는 것만으로 끝나지 않는다. 바이트가 DB에 남아 있으면
+    // 주소로 계속 열리기 때문에, 아무도 그 사진을 참조하지 않을 때 행까지 지운다.
+    socket.on("deleteMessage", (payload) => {
+      const { nickname, room } = socket.data;
+      if (!nickname || !room) return; // 로비에서는 지울 것이 없다
+      // 삭제 한 번은 방 전체로 나가는 1:N이다. join·deleteRoom과 같은 버킷.
+      if (!allowedAction()) return;
+
+      // 모양부터 본다 (image 핸들러와 같은 이유).
+      const messageId = readString(payload, "messageId");
+      if (!UUID.test(messageId)) return;
+
+      const result = removeMessage(room, messageId, nickname);
+      if (result.status === "notfound") {
+        socket.emit("chatError", "이미 사라진 메시지예요.");
+        return;
+      }
+      if (result.status === "denied") {
+        socket.emit("chatError", "내가 보낸 것만 취소할 수 있어요.");
+        return;
+      }
+
+      // 기록에서 빠진 뒤에 알린다 — 순서가 반대면 이 알림을 받고 다시 들어온
+      // 사람이 방금 지운 메시지를 history로 돌려받는다.
+      io.to(room).emit("messageDeleted", messageId);
+
+      const removed = result.message;
+      if (removed.kind !== "image") return;
+      // 같은 사진을 가리키는 메시지가 남아 있으면 바이트는 건드리지 않는다.
+      if (imageInUse(removed.url)) return;
+
+      const imageId = idFromUrl(removed.url);
+      if (!UUID.test(imageId)) return;
+      // 실패해도 메시지는 이미 사라졌다. 바이트는 보관 기간 정리가 걷어가므로
+      // 사용자에게 다시 알리지 않고 로그만 남긴다.
+      void deleteImage(imageId).catch((e: unknown) => {
+        console.error("이미지 삭제 실패:", e instanceof Error ? e.message : e);
+      });
     });
 
     // 입력 중 표시: 나를 제외한 방 사람들에게만.
