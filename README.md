@@ -2,6 +2,9 @@
 
 # DocChat
 
+**[라이브 데모 →](https://docchat-izxf.onrender.com)** (Render 무료 티어라 한동안 요청이
+없으면 서버가 잠들고, 첫 접속 시 깨어나느라 최대 1분 정도 걸릴 수 있음)
+
 문서(txt, md)를 업로드하면 그 문서 내용을 근거로만 답변하는 RAG 챗봇임.
 여기에 여러 명이 같은 방에서 대화하는 실시간 채팅을 함께 넣었음.
 TypeScript, React, Express, PostgreSQL(pgvector), Socket.IO, Gemini API로 만들었음.
@@ -289,5 +292,9 @@ docker-compose.yml    pgvector 포함 Postgres
 - 채팅에 로그인이 없어 닉네임을 아무나 쓸 수 있음.
 - 서버와 프런트가 이벤트 계약 타입을 각자 복사해 갖고 있음. 지금 규모에선
   워크스페이스를 도입하는 비용이 더 커서 미뤘고, 커지면 공용 패키지로 뺄 계획임.
-- 배포는 Neon(pgvector 지원) + Render + Netlify 무료 티어 조합으로 올릴
-  예정임.
+- 배포: Neon(pgvector 지원) + Render 무료 티어. 프런트(React 빌드 결과)와
+  백엔드를 같은 Render 서비스 하나로 합쳐서 서빙함 — web/api.ts와
+  realtime/socket.ts가 상대경로·같은 오리진을 가정하고 있어서, 프런트만
+  Netlify 같은 별도 정적 호스팅으로 나누면 그 코드에 백엔드 절대 주소를
+  따로 심어줘야 한다. 무료 티어라 한동안 요청이 없으면 서버가 잠들고
+  깨어나는 데 시간이 걸린다(위 라이브 데모 링크 참고).
