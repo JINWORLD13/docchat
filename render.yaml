@@ -1,0 +1,15 @@
+services:
+  - type: web
+    name: docchat
+    runtime: node
+    plan: free
+    branch: main
+    buildCommand: npm install --prefix web && npm run build --prefix web && npm install --prefix server
+    startCommand: npm start --prefix server
+    envVars:
+      - key: GEMINI_API_KEY
+        sync: false
+      - key: DATABASE_URL
+        sync: false
+      - key: GEMINI_CHAT_MODEL
+        value: gemini-3.6-flash

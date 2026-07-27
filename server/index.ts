@@ -1,4 +1,5 @@
 import "dotenv/config";
+import path from "node:path";
 import express, { type ErrorRequestHandler } from "express";
 import cors from "cors";
 import { createServer } from "node:http";
@@ -106,6 +107,15 @@ app.use("/api/documents", rateLimit, documentsRouter);
 app.use("/api/chat/image", imagesRouter);
 // rateLimit을 chat 앞단에 둔다: 맨 먼저 사용자별 폭주를 걸러낸 뒤 라우터로 넘긴다.
 app.use("/api/chat", rateLimit, chatRouter);
+
+// 프런트 빌드 결과물(web/dist)을 같은 오리진에서 서빙한다.
+// 배포를 Netlify/Render로 나누지 않고 이 서버 하나로 합친 이유: web/api.ts와
+// realtime/socket.ts가 상대경로("/api")·오리진 없는 io()로 "같은 오리진"을
+// 가정하고 있어서, 나눠 배포하면 CORS·소켓 주소를 프런트 코드에 따로 심어줘야
+// 한다. 같은 프로세스가 정적 파일까지 서빙하면 그 문제 자체가 생기지 않는다.
+// 로컬 개발(`web`에서 `npm run dev`, 포트 5173)에는 영향 없다 — web/dist가
+// 없으면 express.static은 그냥 next()로 넘기고 아래 404로 떨어진다.
+app.use(express.static(path.join(import.meta.dirname, "../web/dist")));
 
 const errorHandler: ErrorRequestHandler = (err, _req, res, next) => {
   const info = typeof err === "object" && err !== null ? (err as Record<string, unknown>) : {};
