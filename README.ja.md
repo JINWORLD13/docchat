@@ -1,4 +1,4 @@
-[한국어](README.md) | **日本語**
+[한국어](README.md) | **日本語** | [English](README.en.md)
 
 # DocChat
 

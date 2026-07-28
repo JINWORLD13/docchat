@@ -1,4 +1,4 @@
-**한국어** | [日本語](RELIABILITY.ja.md)
+**한국어** | [日本語](RELIABILITY.ja.md) | [English](RELIABILITY.en.md)
 
 # DocChat — 부하와 장애 대응 설계
 
