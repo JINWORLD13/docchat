@@ -13,7 +13,11 @@ body {
 .root {
   display: flex;
   flex-direction: column;
+  /* 폰에서 100vh는 "지금 보이는 높이"가 아니라 "주소창이 숨었을 때의 높이"라,
+     주소창이 떠 있는 동안 입력창이 화면 밖으로 밀려난다. dvh가 실제로 보이는
+     높이다. (dvh를 모르는 브라우저는 이 줄을 버리고 위 100vh를 쓴다) */
   height: 100vh;
+  height: 100dvh;
 }
 
 .topnav {
@@ -55,6 +59,14 @@ body {
   min-height: 0;
 }
 
+/* 지금 안 보이는 탭. 문서 Q&A 화면은 언마운트 대신 이걸 뒤집어쓴다(App.tsx).
+   visibility: hidden이 아니라 display: none인 이유가 둘 있다. 안 보이는 화면이
+   레이아웃 자리를 계속 차지하지 않고, 그 안의 입력창·버튼이 Tab 순서에서도
+   빠져 보이지도 않는 곳으로 포커스가 빨려 들어가지 않는다. */
+.tab-hidden {
+  display: none;
+}
+
 /* ---------- 사이드바 ---------- */
 
 .sidebar {
@@ -66,6 +78,23 @@ body {
   display: flex;
   flex-direction: column;
   overflow-y: auto;
+}
+
+/* 머리(제목·접기 버튼)와 몸통(업로드·문서 목록)을 나눠 감싼다. 좁은 화면에서
+   몸통만 접고 스크롤시키기 위해서다.
+   둘 다 굳이 flex인 이유: 감싸기 전엔 자식들이 .sidebar(flex)의 항목이었다.
+   그냥 블록으로 감싸면 .tagline의 아래 margin이 상자 밖으로 새어 나가면서
+   (margin collapsing) 데스크톱 간격이 조용히 달라진다. */
+.sidebar-head,
+.sidebar-body {
+  display: flex;
+  flex-direction: column;
+}
+
+/* 문서 목록 접기/펼치기 — 좁은 화면 전용이라 여기선 감춰만 둔다.
+   데스크톱 사이드바는 늘 펼쳐져 있으므로 버튼 자체가 할 일이 없다. */
+.sidebar-toggle {
+  display: none;
 }
 
 .sidebar h1 {
@@ -804,6 +833,19 @@ body {
   flex-shrink: 0;
 }
 
+/* 연결이 끊긴 상태. 초록 점만 있고 꺼진 상태가 없으면, 점은 "잘 되고 있다"가
+   아니라 그냥 장식이 된다 — 항상 초록이니 볼 이유가 없다. */
+.roomlist-me-dot.off {
+  background: #cbd5e1;
+}
+
+.roomlist-me-state {
+  margin-left: auto;
+  font-size: 11px;
+  font-weight: 500;
+  color: #94a3b8;
+}
+
 .roomlist-new {
   display: flex;
   gap: 6px;
@@ -1194,6 +1236,19 @@ body {
   flex-shrink: 0;
 }
 
+/* 서버와 끊겼다. 오류(빨강)도 알림(파랑)도 아닌 "지금 안 되는 중"이라
+   회색으로 둔다. 사용자가 뭘 잘못한 게 아니고, 곧 저절로 돌아온다. */
+.chat-offline {
+  background: #f1f5f9;
+  color: #475569;
+  font-size: 13px;
+  text-align: center;
+  padding: 8px 12px;
+  border-radius: 8px;
+  margin-bottom: 12px;
+  flex-shrink: 0;
+}
+
 /* ---------- 이미지 ---------- */
 
 .image-wrap {
@@ -1333,5 +1388,265 @@ body {
 @media (max-width: 600px) {
   .users {
     display: none;
+  }
+}
+
+/* ============================================================
+   좁은 화면 (<= 720px)
+
+   기준을 720px로 잡은 근거: 이 앱의 고정폭 기둥은 .sidebar 280px와
+   .roomlist 240px다. 말풍선이 서너 글자마다 꺾이지 않으려면 대화 영역에
+   400px는 남아야 하는데, 280 + 400 ≈ 680이라 그 바로 위에서 기둥을 접는다.
+   375px(가장 좁은 흔한 폰)에서는 기둥을 그대로 두면 대화 영역이 95px까지
+   찌그러졌다 — 쓸 수 없는 화면이었다.
+
+   좁은 화면 규칙은 각 섹션 옆에 흩뿌리지 않고 여기 한 덩어리로 모은다.
+   흩어놓으면 "폰에서 무엇이 달라지는가"를 확인할 때마다 파일 전체를 훑어야
+   한다. (위쪽의 640px/600px 두 규칙은 원래 있던 것이라 자리를 지켰다)
+   ============================================================ */
+
+@media (max-width: 720px) {
+  /* ---------- 상단 탭 ---------- */
+
+  /* 375px에 브랜드 + 탭 3개가 들어가야 한다. 글자와 여백을 줄여 맞추되,
+     폰트가 더 큰 기기에서 넘칠 경우에 대비해 네비 자체를 가로 스크롤로
+     열어둔다 — 넘치는 곳이 네비 안이면 페이지 전체가 가로로 밀리지 않는다.
+     스크롤바는 48px 막대 안에서 자리를 뺏으므로 숨긴다. */
+  .topnav {
+    gap: 2px;
+    padding: 0 10px;
+    overflow-x: auto;
+    scrollbar-width: none;
+  }
+
+  .topnav::-webkit-scrollbar {
+    display: none;
+  }
+
+  .topnav .brand {
+    font-size: 15px;
+    margin-right: 6px;
+    flex-shrink: 0;
+  }
+
+  .topnav button {
+    padding: 8px;
+    font-size: 13px;
+    white-space: nowrap;
+    flex-shrink: 0;
+  }
+
+  /* ---------- 문서 Q&A: 사이드바를 위쪽 접이식 구역으로 ---------- */
+
+  .app {
+    flex-direction: column;
+  }
+
+  .sidebar {
+    width: 100%;
+    max-height: 55vh;
+    padding: 8px 12px;
+    border-right: none;
+    border-bottom: 1px solid #e4e7eb;
+    /* 스크롤은 안쪽 .sidebar-body가 맡는다. 사이드바째로 굴리면 펼쳤을 때
+       접기 버튼까지 위로 밀려 올라가 다시 접을 길이 사라진다. */
+    overflow: hidden;
+  }
+
+  /* 상단 네비에 이미 'DocChat'이 있다. 같은 이름을 한 번 더, 그것도 22px로
+     박아 세로 공간을 쓸 이유가 없다. */
+  .sidebar h1,
+  .sidebar .tagline {
+    display: none;
+  }
+
+  .sidebar-toggle {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 8px;
+    width: 100%;
+    min-height: 40px;
+    padding: 8px 12px;
+    border: 1px solid #e4e7eb;
+    border-radius: 8px;
+    background: #fff;
+    font-family: inherit;
+    font-size: 14px;
+    font-weight: 600;
+    color: #1f2328;
+    text-align: left;
+    cursor: pointer;
+  }
+
+  .sidebar-caret {
+    color: #9ca3af;
+    transition: transform 0.15s;
+  }
+
+  .sidebar-open .sidebar-caret {
+    transform: rotate(180deg);
+  }
+
+  .sidebar .sidebar-body {
+    display: none;
+  }
+
+  .sidebar.sidebar-open .sidebar-body {
+    display: flex;
+    flex: 1;
+    min-height: 0;
+    margin-top: 10px;
+    overflow-y: auto;
+  }
+
+  .doc-list {
+    margin-top: 12px;
+  }
+
+  /* ---------- 문서 Q&A: 대화 영역 ---------- */
+
+  /* flex: 1만으로는 부족하다. flex 항목의 기본 min-height는 auto라 내용만큼
+     부풀어서, 안쪽 .messages가 스크롤되는 대신 화면 밖으로 자란다. */
+  .chat {
+    min-height: 0;
+  }
+
+  .messages {
+    padding: 16px 12px;
+  }
+
+  /* 720px 제한은 이 폭에선 걸리지도 않는다. 대신 화면 끝까지 꽉 찬 말풍선은
+     누가 한 말인지 구분이 안 되므로, 반대쪽에 여백을 남긴다. */
+  .message {
+    max-width: 88%;
+  }
+
+  .input-bar {
+    padding: 10px 12px;
+  }
+
+  /* 글자가 16px보다 작으면 iOS 사파리가 입력창을 누를 때 화면을 확대한다.
+     확대는 자동으로 풀리지 않아서, 그때부터 레이아웃이 가로로 밀린 채 남는다. */
+  .input-bar input,
+  .send-bar input,
+  .join-card input,
+  .roomlist-new input,
+  .modal-textarea {
+    font-size: 16px;
+  }
+
+  .input-bar button,
+  .send-bar button {
+    padding: 0 16px;
+  }
+
+  /* ---------- 대시보드 ---------- */
+
+  .dash {
+    padding: 16px 12px;
+  }
+
+  .dash-head h2 {
+    font-size: 18px;
+  }
+
+  .metric {
+    padding: 12px 10px;
+  }
+
+  .metric-value {
+    font-size: 20px;
+  }
+
+  /* 레이어 카드 한 줄("읽기 대기 0 · 쓰기 대기 0 · 미디어 대기 0")과 로그 한 줄은
+     한글과 모노스페이스가 섞여 있어 좁은 폭에서 쉽게 넘친다. 줄바꿈을 허용하고
+     글자를 한 단계 줄인다 — 잘라내면 어느 풀이 막힌 건지가 사라진다. */
+  .layer-stat,
+  .event {
+    font-size: 12px;
+    line-height: 1.6;
+    word-break: break-word;
+  }
+
+  .layer {
+    padding: 10px 12px;
+  }
+
+  .event-log {
+    padding: 12px;
+  }
+
+  /* ---------- 실시간 채팅 ---------- */
+
+  /* 방 목록도 사이드바와 같은 고정폭 문제를 안고 있다. 컴포넌트는 다른 사람이
+     보고 있으므로 여기서는 CSS로 세로 스택으로만 바꾼다. */
+  .live {
+    flex-direction: column;
+  }
+
+  .roomlist {
+    width: 100%;
+    max-height: 34vh;
+    border-right: none;
+    border-bottom: 1px solid #e4e7eb;
+  }
+
+  .chatroom,
+  .live-empty {
+    min-height: 0;
+  }
+
+  .room-head {
+    padding: 10px 12px;
+  }
+
+  .chatroom .messages {
+    padding: 14px 12px;
+  }
+
+  .bubble-row {
+    max-width: 85%;
+  }
+
+  .send-bar {
+    padding: 10px 12px;
+  }
+
+  /* ---------- 문서 팝업 ---------- */
+
+  .modal-overlay {
+    padding: 12px;
+  }
+
+  .modal {
+    max-height: 92vh;
+  }
+
+  .modal-head,
+  .modal-foot {
+    padding: 12px 14px;
+  }
+
+  .modal-textarea {
+    min-height: 180px;
+    margin: 12px 14px 0;
+    padding: 12px;
+  }
+
+  /* 안내 문구와 버튼 두 개가 한 줄에 있으면 375px에서 버튼이 글자 폭까지
+     찌그러진다. 문구를 윗줄로 올리고 버튼만 한 줄을 차지하게 둔다. */
+  .modal-foot {
+    flex-wrap: wrap;
+    gap: 8px;
+  }
+
+  .modal-hint {
+    flex: 1 1 100%;
+  }
+
+  .modal-actions {
+    flex: 1;
+    justify-content: flex-end;
   }
 }
