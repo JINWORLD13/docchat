@@ -10,9 +10,26 @@ const router = Router();
 // 더 키우지 않는 이유는 이 바이트가 그대로 DB row로 들어가기 때문이다.
 const MAX_BYTES = 2 * 1024 * 1024;
 
+// 파일 크기만 막는 것으로는 부족하다.
+//
+// multer에 fileSize와 files만 주면 나머지는 busboy 기본값이 되는데, 그 기본값은
+// fields: Infinity다. 즉 파일 없이 텍스트 필드만 40만 개 담은 요청을 보내면
+// 우리가 손대기도 전에 전부 메모리에 쌓인다 — 실제로 47MB 요청 하나에 프로세스
+// 메모리가 130MB에서 300MB로 뛰었고, 넷을 동시에 보내면 550MB였다.
+// 무료 티어 상한이 512MB라 그대로 죽는다. 그러면 같은 프로세스에 얹힌 실시간
+// 채팅도 함께 끊긴다(db.ts에서 풀을 나눠 지키려던 것이 프로세스째 날아간다).
+//
+// 우리가 실제로 쓰는 건 이미지 1개와 width·height 두 필드뿐이다. 쓰는 만큼만 연다.
 const upload = multer({
   storage: multer.memoryStorage(),
-  limits: { fileSize: MAX_BYTES, files: 1 },
+  limits: {
+    fileSize: MAX_BYTES,
+    files: 1,
+    fields: 4, // width, height + 여유
+    parts: 6, // 파일 1 + 필드 4 + 여유
+    fieldSize: 32, // 숫자 몇 자리면 충분하다
+    fieldNameSize: 50,
+  },
 });
 
 // 업로드 전용 제한. /api/chat의 질문 제한(10/5)과 따로 두는 이유는
@@ -27,7 +44,10 @@ const uploadBuckets = new TokenBuckets(
 // 지우지 않으면 한 번이라도 업로드한 IP가 전부 영구히 남는다
 // (ratelimit.ts와 같은 이유·같은 방식).
 const IDLE_MS = 10 * 60 * 1000;
-const sweeper = setInterval(() => uploadBuckets.sweep(IDLE_MS), 60 * 1000);
+const sweeper = setInterval(() => {
+  uploadBuckets.sweep(IDLE_MS);
+  viewBuckets.sweep(IDLE_MS);
+}, 60 * 1000);
 sweeper.unref();
 
 const limitUploads: RequestHandler = (req, res, next) => {
@@ -36,6 +56,29 @@ const limitUploads: RequestHandler = (req, res, next) => {
   if (!result.ok) {
     res.setHeader("Retry-After", String(result.retryAfterSec));
     res.status(429).json({ error: "이미지를 너무 빨리 올리고 있어요. 잠시 후 다시 시도해주세요." });
+    return;
+  }
+  next();
+};
+
+// 조회 쪽 제한.
+//
+// 업로드만 막고 조회를 열어두면 격리(Bulkhead)가 헛돈다. mediaPool은 max가 4라
+// 상한을 못박은 풀인데, 조회에 제한이 없으면 동시 요청 몇백 건으로 그 4개를
+// 계속 점유할 수 있고 그러면 방 전체의 사진이 한꺼번에 안 뜬다. 캐시 헤더가
+// 정상 사용자를 막아주지만, 캐시를 무시하는 쪽은 그대로 통과한다.
+// 정상 사용(방 하나에 사진 수십 장)은 넉넉히 통과하도록 크게 잡는다.
+const viewBuckets = new TokenBuckets(
+  Number(process.env.IMG_VIEW_CAPACITY || 120),
+  Number(process.env.IMG_VIEW_REFILL || 20)
+);
+
+const limitViews: RequestHandler = (req, res, next) => {
+  const ip = req.ip || req.socket.remoteAddress || "unknown";
+  const result = viewBuckets.take(ip);
+  if (!result.ok) {
+    res.setHeader("Retry-After", String(result.retryAfterSec));
+    res.status(429).json({ error: "이미지를 너무 빨리 불러오고 있어요." });
     return;
   }
   next();
@@ -72,8 +115,9 @@ router.post("/", limitUploads, upload.single("image"), async (req, res) => {
 });
 
 // --- 조회 ---
-router.get("/:id", async (req, res) => {
-  const id = req.params.id;
+router.get("/:id", limitViews, async (req, res) => {
+  // 미들웨어가 붙으면서 Express가 params를 넓은 타입으로 주므로 여기서 좁힌다.
+  const id = typeof req.params.id === "string" ? req.params.id : "";
   if (!UUID.test(id)) {
     res.status(400).json({ error: "잘못된 이미지 id입니다." });
     return;

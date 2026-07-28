@@ -9,14 +9,22 @@
 // 화면을 덮어버리므로, 순간 버스트를 더 좁게 잡았다.
 //
 // 버킷을 소켓 id가 아니라 IP로 나누는 이유:
-// 예전엔 키가 socket.id였다. 그런데 socket.id는 연결할 때마다 새로 생기고
-// disconnect 때 버킷을 지우므로, "5발 쏘고 → 끊고 → 다시 붙으면" 매번 새
-// 버킷을 만땅으로 받았다. 제한이 사실상 재연결 속도에만 걸리는 셈이라
-// 도배를 전혀 못 막는다. 그래서 재연결해도 따라오는 값(IP)을 키로 쓴다.
+// 예전엔 키가 socket.id였다. 그런데 socket.id는 연결할 때마다 새로 생기므로
+// "5발 쏘고 → 끊고 → 다시 붙으면" 매번 새 버킷을 만땅으로 받았다. 제한이
+// 사실상 재연결 속도에만 걸리는 셈이라 도배를 전혀 못 막는다.
+// 그래서 재연결해도 따라오는 값(IP)을 키로 쓴다.
 //
-// 대신 회수는 여전히 정확한 시점에 한다. IP당 살아 있는 소켓 수를 세고,
-// 마지막 하나가 끊길 때 그 IP의 버킷을 즉시 지운다 — HTTP 쪽처럼 유휴 스윕에
-// 기대지 않아도 되는 건, 소켓에는 disconnect라는 명확한 종료 신호가 있어서다.
+// 그런데 키만 바꿔서는 반만 고친 것이었다.
+// 소켓에는 disconnect라는 명확한 종료 신호가 있으니 마지막 소켓이 끊길 때
+// 버킷을 즉시 지우는 게 깔끔하다고 봤는데, 그게 바로 위의 우회를 되살렸다 —
+// 혼자 접속한 사람은 끊는 순간 자기 버킷이 사라지고, 다시 붙으면 만땅이다.
+// 실제로 재보니 유지 연결로 9발 나갈 시간에 끊었다 붙으면 20발이 나갔다.
+//
+// 여기서 배운 것: 제한의 수명은 연결의 수명보다 길어야 한다. 연결이 끝난 걸
+// 안다고 해서 "이 사람이 쓴 예산"까지 잊어도 되는 건 아니다. 종료 신호는
+// 회수 시점을 정하는 근거로는 맞지만, 제한을 지우는 근거로는 틀렸다.
+// 그래서 회수는 HTTP 쪽과 똑같이 유휴 스윕으로 한다. 살아 있는 소켓 수는
+// 여전히 세지만, 그건 IP당 동시 연결 상한에만 쓴다.
 
 import { TokenBuckets, type TokenBucketStats } from "../tokenbucket.ts";
 
@@ -37,7 +45,18 @@ const MAX_SOCKETS_PER_IP = Number(process.env.CHAT_MAX_SOCKETS_PER_IP || 10);
 const messageBuckets = new TokenBuckets(CAPACITY, REFILL_PER_SEC);
 const actionBuckets = new TokenBuckets(ACTION_CAPACITY, ACTION_REFILL);
 
-// IP -> 지금 붙어 있는 소켓 수. 0이 되는 순간 그 IP의 버킷을 회수한다.
+// 유휴 버킷 회수. 끊겼다고 지우지 않고, 한동안 아무 활동이 없을 때만 지운다
+// (위 헤더 주석 참고 — 지우는 시점이 곧 우회 지점이었다).
+// 충전 속도가 초당 2개라 10분이면 어차피 만땅이므로, 그때 지우는 것은
+// "예산을 잊는" 것이 아니라 "이미 다 회복된 빈 항목을 치우는" 것이다.
+const IDLE_MS = 10 * 60 * 1000;
+const sweeper = setInterval(() => {
+  messageBuckets.sweep(IDLE_MS);
+  actionBuckets.sweep(IDLE_MS);
+}, 60 * 1000);
+sweeper.unref();
+
+// IP -> 지금 붙어 있는 소켓 수. IP당 동시 연결 상한에만 쓴다.
 const liveSockets = new Map<string, number>();
 
 // 연결을 등록한다. 상한을 넘으면 false — 부르는 쪽에서 연결을 끊는다.
@@ -48,7 +67,10 @@ export function addSocket(ip: string): boolean {
   return true;
 }
 
-// 연결이 끊겼다. 그 IP의 마지막 소켓이었으면 버킷까지 정리한다.
+// 연결이 끊겼다. 연결 수만 줄인다.
+//
+// 버킷은 일부러 남긴다. 여기서 지우면 "끊었다 다시 붙기"로 제한이 초기화된다 —
+// 정확히 socket.id를 키로 썼을 때의 우회가 되돌아온다. 회수는 위의 스윕이 한다.
 export function removeSocket(ip: string): void {
   const n = (liveSockets.get(ip) ?? 1) - 1;
   if (n > 0) {
@@ -56,8 +78,6 @@ export function removeSocket(ip: string): void {
     return;
   }
   liveSockets.delete(ip);
-  messageBuckets.drop(ip);
-  actionBuckets.drop(ip);
 }
 
 export function allowMessage(ip: string): boolean {

@@ -16,6 +16,7 @@
 
 const NICK_KEY = "docchat.chat.nickname";
 const ROOM_KEY = "docchat.chat.room";
+const CLIENT_KEY = "docchat.chat.clientKey";
 
 function read(key: string): string | null {
   try {
@@ -49,4 +50,33 @@ export function saveNickname(nickname: string | null): void {
 
 export function saveRoom(room: string | null): void {
   write(ROOM_KEY, room);
+}
+
+// 이 탭의 신원.
+//
+// 방 삭제·보낸 것 취소의 권한이 이 값에서 나온다(server/realtime/identity.ts).
+// 서버로만 보내고 화면에는 쓰지 않는다 — 이 값을 아는 사람이 곧 나이기 때문에,
+// 다른 사람에게 보이는 자리에 실으면 그대로 흉내낼 수 있다.
+//
+// 닉네임·방과 같은 sessionStorage에 두는 이유도 같다. localStorage에 두면 탭
+// 두 개가 같은 신원을 공유해서, README가 안내하는 "탭 두 개로 대화해보기"에서
+// 한쪽이 다른 쪽의 메시지를 지울 수 있게 된다. 탭이 곧 사람인 데모라
+// 신원의 범위도 탭에 맞춘다.
+//
+// 새로고침에는 남고 탭을 닫으면 사라진다. 그래서 "새로고침하면 내 방을 못
+// 지운다"는 문제는 없고, 대신 탭을 닫으면 신원도 끝난다 — 방과 대화 기록이
+// 서버 메모리에만 있는 것과 같은 수명이라 어긋나지 않는다.
+export function loadClientKey(): string {
+  const existing = read(CLIENT_KEY);
+  if (existing) return existing;
+
+  // crypto.randomUUID는 보안 컨텍스트(https·localhost)에서만 있다.
+  // 없는 환경에서도 채팅 자체는 돌아야 하므로 약한 대체값을 쓴다 — 그 경우
+  // 신원의 강도가 떨어지지만, 애초에 그런 환경은 로컬 실험용이다.
+  const key =
+    typeof crypto !== "undefined" && "randomUUID" in crypto
+      ? crypto.randomUUID()
+      : `k${Date.now().toString(36)}${Math.random().toString(36).slice(2, 10)}`;
+  write(CLIENT_KEY, key);
+  return key;
 }

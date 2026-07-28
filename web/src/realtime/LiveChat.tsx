@@ -3,7 +3,7 @@ import Nickname from "./Nickname";
 import RoomList from "./RoomList";
 import Room from "./Room";
 import { socket } from "./socket";
-import { loadNickname, loadRoom, saveNickname, saveRoom } from "./session";
+import { loadClientKey, loadNickname, loadRoom, saveNickname, saveRoom } from "./session";
 import type { RoomSummary } from "./types";
 
 // 실시간 채팅 탭 전체.
@@ -21,6 +21,10 @@ export default function LiveChat() {
   const [room, setRoom] = useState<string | null>(loadRoom);
   const [error, setError] = useState<string | null>(null);
   const [notice, setNotice] = useState<string | null>(null);
+  // 서버가 알려준 내 공개 신원. 이게 있어야 "내 메시지"를 판단할 수 있다.
+  const [authorId, setAuthorId] = useState<string | null>(null);
+  // 지금 서버에 붙어 있나. 끊긴 걸 화면이 모르면, 보낸 메시지가 조용히 사라진다.
+  const [connected, setConnected] = useState(socket.connected);
 
   // 재연결 시 어느 방으로 돌아가야 하는지. state를 그대로 쓰면 아래 effect가
   // [nickname]에만 걸려 있어 방을 옮겨도 옛 값이 잡힌다.
@@ -57,11 +61,26 @@ export default function LiveChat() {
     // 그래서 재입장은 반드시 여기 한 곳에서 hello → join 순으로 내보낸다.
     // Room이 각자 하면 React가 자식 effect를 먼저 실행해 join이 앞질러 나간다.
     const onConnect = () => {
-      socket.emit("hello", { nickname });
+      setConnected(true);
+      // clientKey를 같이 보낸다 — 서버는 이걸로 신원(authorId)을 만든다.
+      // 재연결해도 같은 값이라야 새로고침 후에도 자기 방을 지울 수 있다.
+      socket.emit("hello", { nickname, clientKey: loadClientKey() });
       if (roomRef.current) socket.emit("join", { room: roomRef.current });
     };
 
+    // 끊긴 걸 화면이 알아야 한다.
+    //
+    // 예전엔 이 리스너가 아예 없었다. socket.io는 조용히 재연결을 시도하는데,
+    // 그동안 보낸 메시지는 버퍼에 쌓였다가 재연결 직후 hello보다 먼저 서버에
+    // 도착한다. 서버 입장에서는 닉네임도 방도 없는 소켓이 보낸 것이라 그냥
+    // 버린다 — 오류조차 안 돌아오고, 입력창은 비워져서 보낸 것처럼 보인다.
+    // 무료 티어 콜드스타트(수십 초)마다 밟는 길이라 흔한 일이다.
+    const onDisconnect = () => setConnected(false);
+    const onMe = (id: string) => setAuthorId(id);
+
     socket.on("connect", onConnect);
+    socket.on("disconnect", onDisconnect);
+    socket.on("me", onMe);
     socket.on("rooms", onRooms);
     socket.on("roomClosed", onRoomClosed);
     socket.on("chatError", onError);
@@ -72,6 +91,8 @@ export default function LiveChat() {
 
     return () => {
       socket.off("connect", onConnect);
+      socket.off("disconnect", onDisconnect);
+      socket.off("me", onMe);
       socket.off("rooms", onRooms);
       socket.off("roomClosed", onRoomClosed);
       socket.off("chatError", onError);
@@ -115,7 +136,7 @@ export default function LiveChat() {
     setRoom(null);
   }
 
-  // 방 삭제. 권한 확인은 서버가 한다 — 목록의 owner는 버튼을 보여줄지 정하는
+  // 방 삭제. 권한 확인은 서버가 한다 — 목록의 ownerId는 버튼을 보여줄지 정하는
   // 힌트일 뿐이고, 클라이언트가 보낸 값은 어차피 못 믿는다.
   function removeRoom(name: string) {
     setError(null);
@@ -128,7 +149,9 @@ export default function LiveChat() {
       <RoomList
         rooms={rooms}
         current={room}
+        authorId={authorId}
         nickname={nickname}
+        connected={connected}
         onSelect={selectRoom}
         onDelete={removeRoom}
       />
@@ -138,13 +161,18 @@ export default function LiveChat() {
         <Room
           key={room}
           nickname={nickname}
+          authorId={authorId}
           room={room}
+          connected={connected}
           error={error}
           onDismissError={() => setError(null)}
           onLeave={leaveRoom}
         />
       ) : (
         <div className="live-empty">
+          {!connected && (
+            <div className="chat-offline">서버와 연결이 끊겼어요. 다시 연결하는 중…</div>
+          )}
           <p className="live-empty-title">방을 고르거나 새로 만들어주세요.</p>
           <p className="live-empty-sub">
             브라우저 탭을 두 개 열고 같은 방에 들어가면 실시간으로 대화가 오갑니다.

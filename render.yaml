@@ -13,3 +13,14 @@ services:
         sync: false
       - key: GEMINI_CHAT_MODEL
         value: gemini-3.6-flash
+      # Render는 TLS를 자기 엣지에서 끊고 우리 서버에는 평문 HTTP로 넘긴다.
+      # 즉 프록시가 정확히 한 홉 앞에 있다. 이 값을 안 주면(기본 0) 접속자
+      # 전원의 IP가 그 프록시 주소 하나로 보여서, IP별 rate limit이 통째로
+      # "전체 공용 한도"가 되고 IP당 동시 소켓 상한(기본 10) 때문에 11번째
+      # 방문자부터 채팅 접속이 거절된다. 실제로 그 상태로 배포돼 있었다.
+      #
+      # 반대로 프록시가 없는데 1을 주면 클라이언트가 X-Forwarded-For를 직접
+      # 넣어 요청마다 다른 IP인 척할 수 있다. 숫자는 배포 형태를 아는 사람이
+      # 실제 홉 수를 세어 넣어야 하는 값이다.
+      - key: TRUST_PROXY
+        value: "1"

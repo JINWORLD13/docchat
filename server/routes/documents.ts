@@ -8,13 +8,32 @@ import { embedTexts } from "../gemini.ts";
 import { requireWriteAccess } from "../admin.ts";
 
 const router = Router();
+// fileSize 말고도 상한을 준다. 이유는 routes/images.ts에 적어둔 것과 같다 —
+// multer는 나머지를 busboy 기본값(fields: Infinity)으로 두므로, 파일 없이
+// 텍스트 필드만 잔뜩 담은 요청이 우리 코드에 닿기도 전에 메모리를 채운다.
+// 이 라우터는 requireWriteAccess 뒤에 있어 노출은 덜하지만, 같은 실수를
+// 두 곳에 남겨둘 이유가 없다.
 const upload = multer({
   storage: multer.memoryStorage(),
-  limits: { fileSize: 1024 * 1024 },
+  limits: { fileSize: 1024 * 1024, files: 1, fields: 2, parts: 4, fieldSize: 100 },
 });
 
 const MAX_CHUNKS = 300;
 const EMBED_BATCH = 10;
+
+// id는 serial(int4) 컬럼이다. Number.isInteger만 보면 99999999999도 통과해서
+// Postgres가 범위 초과로 거절하고, 그게 500으로 잡힌다 — 클라이언트 실수가
+// 서버 에러율에 섞이는 것을 막자는 index.ts의 기준과 어긋난다.
+// raw를 unknown으로 받는 이유: 미들웨어가 붙은 라우트에서는 Express가
+// req.params.id를 string[]까지 포함한 타입으로 넓혀서 준다. 어차피 숫자로
+// 바꿔 검사할 값이라, 좁히는 책임을 이 함수 안에 둔다.
+const MAX_INT4 = 2147483647;
+function validId(raw: unknown): number | null {
+  if (typeof raw !== "string") return null;
+  const id = Number(raw);
+  if (!Number.isSafeInteger(id) || id < 1 || id > MAX_INT4) return null;
+  return id;
+}
 
 type DocumentSummary = {
   id: number;
@@ -85,8 +104,8 @@ router.get("/", async (_req, res) => {
 
 // 문서 한 개의 원문을 반환한다 (열람/수정 팝업에서 사용)
 router.get("/:id", async (req, res) => {
-  const id = Number(req.params.id);
-  if (!Number.isInteger(id)) {
+  const id = validId(req.params.id);
+  if (id === null) {
     res.status(400).json({ error: "잘못된 문서 id입니다." });
     return;
   }
@@ -156,8 +175,8 @@ router.post("/", requireWriteAccess, upload.single("file"), async (req, res) => 
 
 // 원문을 수정하면 청크와 임베딩을 다시 만들어 통째로 교체한다.
 router.put("/:id", requireWriteAccess, async (req, res) => {
-  const id = Number(req.params.id);
-  if (!Number.isInteger(id)) {
+  const id = validId(req.params.id);
+  if (id === null) {
     res.status(400).json({ error: "잘못된 문서 id입니다." });
     return;
   }
@@ -204,8 +223,8 @@ router.put("/:id", requireWriteAccess, async (req, res) => {
 });
 
 router.delete("/:id", requireWriteAccess, async (req, res) => {
-  const id = Number(req.params.id);
-  if (!Number.isInteger(id)) {
+  const id = validId(req.params.id);
+  if (id === null) {
     res.status(400).json({ error: "잘못된 문서 id입니다." });
     return;
   }

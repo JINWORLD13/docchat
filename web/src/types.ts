@@ -73,6 +73,9 @@ export interface MetricsResponse {
     rejected: number;
   };
   breaker: { open: boolean; consecutiveFailures: number; reopensInMs: number };
+  // 임베딩 전용 회로. 생성과 나눠 둔 이유는 server/breaker.ts에 있다 —
+  // 생성이 죽으면 출처만 돌려줄 수 있지만, 임베딩이 죽으면 검색조차 못 한다.
+  embedBreaker: { open: boolean; consecutiveFailures: number; reopensInMs: number };
   realtime: { rooms: number; users: number; messagesRejected: number };
   faults: { llmFail: boolean };
 }

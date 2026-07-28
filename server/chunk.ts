@@ -6,7 +6,10 @@ export function chunkText(text: string, size = 200, overlap = 40): string[] {
   if (words.length === 0) return [];
 
   const chunks: string[] = [];
-  const step = size - overlap;
+  // 겹침이 크기 이상이면 step이 0 이하가 되어 start가 영영 안 늘어난다 —
+  // 같은 청크를 무한히 밀어넣다 메모리가 터진다. 지금 부르는 곳은 기본값만
+  // 쓰지만, 공개 함수의 인자를 "부르는 쪽이 알아서 맞추겠지"로 두지 않는다.
+  const step = Math.max(1, size - overlap);
   for (let start = 0; start < words.length; start += step) {
     chunks.push(words.slice(start, start + size).join(" "));
     if (start + size >= words.length) break;

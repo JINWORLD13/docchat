@@ -4,7 +4,10 @@
 interface ChatMessageBase {
   id: string;
   room: string;
-  nickname: string;
+  nickname: string; // 화면에 보이는 이름. 아무나 같은 값을 쓸 수 있다.
+  // 보낸 사람의 공개 신원. "내 것인가"(취소 버튼)를 이걸로 판단한다.
+  // 닉네임으로 판단하면 같은 이름을 쓴 사람의 메시지까지 내 것으로 보인다.
+  authorId: string;
   ts: number;
 }
 
@@ -25,12 +28,13 @@ export type ChatMessage = TextMessage | ImageMessage;
 export interface RoomSummary {
   name: string;
   users: number;
-  owner: string; // 방을 만든 사람. 이 사람에게만 삭제 버튼이 보인다.
+  ownerId: string; // 방을 만든 사람의 공개 신원. 이 사람에게만 삭제 버튼이 보인다.
 }
 
 // 클라이언트 → 서버
 export interface ClientToServer {
-  hello: (payload: { nickname: string }) => void;
+  // clientKey는 이 탭의 비밀값(session.ts). 서버가 이걸로 신원을 만든다.
+  hello: (payload: { nickname: string; clientKey?: string }) => void;
   join: (payload: { room: string }) => void;
   leave: () => void;
   deleteRoom: (payload: { room: string }) => void; // 방 삭제 (방장만)
@@ -44,6 +48,7 @@ export interface ClientToServer {
 
 // 서버 → 클라이언트
 export interface ServerToClient {
+  me: (authorId: string) => void; // 내 공개 신원 (hello 직후 나에게만)
   rooms: (rooms: RoomSummary[]) => void;
   history: (messages: ChatMessage[]) => void;
   message: (message: ChatMessage) => void;

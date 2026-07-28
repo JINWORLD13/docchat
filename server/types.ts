@@ -72,7 +72,10 @@ export interface MetricsResponse {
   mediaPool: PoolStats;
   rateLimit: TokenBucketStats;
   admission: AdmissionStats;
-  breaker: BreakerState;
+  breaker: BreakerState; // 답변 생성(LLM) 회로
+  // 질문 임베딩 회로. 생성과 나눠 두는 이유는 breaker.ts에 적어뒀다 —
+  // 둘은 실패했을 때 할 수 있는 일이 다르다(출처를 돌려줄 수 있나 없나).
+  embedBreaker: BreakerState;
   realtime: RealtimeStats;
   faults: Faults;
 }

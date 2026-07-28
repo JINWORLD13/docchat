@@ -12,7 +12,11 @@
 interface ChatMessageBase {
   id: string;
   room: string;
-  nickname: string;
+  nickname: string; // 화면에 보이는 이름. 아무나 같은 값을 쓸 수 있다.
+  // 보낸 사람의 공개 신원(realtime/identity.ts). 화면은 이걸로 "내 것"을
+  // 판단하고, 서버는 이걸로 취소 권한을 확인한다. 닉네임과 나눈 이유는
+  // 닉네임이 공개값이라 그대로 흉내낼 수 있었기 때문이다.
+  authorId: string;
   ts: number; // epoch ms
 }
 
@@ -37,12 +41,18 @@ export type ChatMessage = TextMessage | ImageMessage;
 export interface RoomSummary {
   name: string;
   users: number;
-  owner: string; // 방을 만든 사람. 이 사람에게만 삭제 버튼이 보인다.
+  // 방을 만든 사람의 공개 신원. 이 값이 내 authorId와 같을 때만 삭제 버튼이
+  // 보인다. 예전엔 방장 닉네임을 그대로 실어 보냈는데, 그러면 로비에 있는
+  // 누구나 "저 방의 주인은 이 이름이다"를 알고 그 이름을 쓰면 그만이었다.
+  ownerId: string;
 }
 
 // 클라이언트 → 서버 (서버가 듣는 이벤트)
 export interface ClientToServer {
-  hello: (payload: { nickname: string }) => void; // 닉네임 등록 → 로비 진입
+  // 닉네임 등록 → 로비 진입.
+  // clientKey는 브라우저가 만들어 보관하는 비밀값이다(realtime/identity.ts).
+  // 재연결해도 같은 값이라야 자기가 만든 방을 계속 지울 수 있다.
+  hello: (payload: { nickname: string; clientKey?: string }) => void;
   join: (payload: { room: string }) => void; // 방 입장 (없으면 생성) / 방 이동
   leave: () => void; // 방만 나가고 로비로
   deleteRoom: (payload: { room: string }) => void; // 방 삭제 (방장만)
@@ -58,6 +68,10 @@ export interface ClientToServer {
 
 // 서버 → 클라이언트 (서버가 보내는 이벤트)
 export interface ServerToClient {
+  // 너의 공개 신원은 이거다. hello 직후 그 소켓에만 보낸다.
+  // 화면이 "이 메시지가 내 것인가"를 판단하려면 자기 authorId를 알아야 하는데,
+  // clientKey는 화면에 쓰기엔 위험한 값이라(그대로 권한이다) 공개형을 따로 준다.
+  me: (authorId: string) => void;
   rooms: (rooms: RoomSummary[]) => void; // 방 목록 (바뀔 때마다 전원에게 push)
   history: (messages: ChatMessage[]) => void; // 입장 시 최근 기록
   message: (message: ChatMessage) => void; // 새 메시지 (방 전체에 브로드캐스트)
@@ -73,6 +87,10 @@ export interface ServerToClient {
 export interface SocketData {
   nickname?: string;
   room?: string;
+  // 권한 판단의 근거. 절대 다른 소켓으로 나가지 않는다 —
+  // 나가는 건 이걸 HMAC한 authorId뿐이다(identity.ts).
+  clientKey?: string;
+  authorId?: string;
 }
 
 // 대시보드에 노출하는 실시간 채팅 상태.

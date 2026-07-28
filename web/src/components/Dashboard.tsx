@@ -166,6 +166,7 @@ export default function Dashboard() {
   const rl = m?.rateLimit;
   const ad = m?.admission;
   const br = m?.breaker;
+  const eb = m?.embedBreaker;
   const rt = m?.realtime;
 
   return (
@@ -235,13 +236,21 @@ export default function Dashboard() {
         <Arrow />
         <Layer
           name="Circuit Breaker"
-          sub="LLM 장애 자동 차단"
-          active={br?.open ?? false}
-          danger={br?.open ?? false}
+          // 회로가 둘인 이유: 질문 경로가 외부로 나가는 지점이 둘이다(임베딩·생성).
+          // 예전엔 생성만 감싸고 있어서, 임베딩 API가 죽으면 회로가 영영 안 열린 채
+          // 요청마다 재시도를 다 소진하고 실패했다. 화면에도 "닫힘"으로만 보였다.
+          sub="외부 API 장애 자동 차단 (임베딩 · 생성)"
+          active={(br?.open ?? false) || (eb?.open ?? false)}
+          danger={(br?.open ?? false) || (eb?.open ?? false)}
           stat={
-            br?.open
-              ? `열림 · ${Math.ceil(br.reopensInMs / 1000)}s 후 재시도`
-              : `닫힘 · 연속실패 ${br?.consecutiveFailures ?? 0}`
+            (br?.open
+              ? `생성 열림 · ${Math.ceil(br.reopensInMs / 1000)}s 후 재시도`
+              : `생성 닫힘 · 연속실패 ${br?.consecutiveFailures ?? 0}`) +
+            (eb?.open
+              ? ` · 임베딩 열림 · ${Math.ceil(eb.reopensInMs / 1000)}s`
+              : (eb?.consecutiveFailures ?? 0) > 0
+                ? ` · 임베딩 실패 ${eb?.consecutiveFailures}`
+                : "")
           }
         />
       </div>

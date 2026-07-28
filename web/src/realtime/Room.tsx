@@ -13,7 +13,11 @@ import type { ChatMessage } from "./types";
 
 interface Props {
   nickname: string;
+  // 내 공개 신원. "내 메시지"(취소 버튼) 판단의 근거다 — 닉네임으로 판단하면
+  // 같은 이름을 쓴 사람의 메시지까지 내 것으로 보인다.
+  authorId: string | null;
   room: string;
+  connected: boolean;
   error: string | null;
   onDismissError: () => void;
   onLeave: () => void;
@@ -52,7 +56,15 @@ async function readDimensions(file: File): Promise<{ width: number; height: numb
 
 // 대화창.
 // 소켓 연결 자체는 LiveChat이 관리한다. 여기는 "이 방에 관한 이벤트"만 구독한다.
-export default function Room({ nickname, room, error, onDismissError, onLeave }: Props) {
+export default function Room({
+  nickname,
+  authorId,
+  room,
+  connected,
+  error,
+  onDismissError,
+  onLeave,
+}: Props) {
   const [items, setItems] = useState<Item[]>([]);
   const [users, setUsers] = useState<string[]>([]);
   const [input, setInput] = useState("");
@@ -63,6 +75,8 @@ export default function Room({ nickname, room, error, onDismissError, onLeave }:
   const listRef = useRef<HTMLDivElement>(null);
   const fileRef = useRef<HTMLInputElement>(null);
   const typingTimer = useRef<number | undefined>(undefined);
+  // 마지막으로 "입력 중"을 보낸 시각 (handleChange에서 묶어 보내기 위해)
+  const lastTypingSent = useRef(0);
 
   useEffect(() => {
     // 핸들러를 변수에 담아두고 off에 그대로 넘긴다.
@@ -136,16 +150,58 @@ export default function Room({ nickname, room, error, onDismissError, onLeave }:
     };
   }, [room]);
 
-  // 새 항목이 오면 맨 아래로 스크롤
+  // 새 항목이 오면 맨 아래로 스크롤 — 단, 이미 아래를 보고 있을 때만.
+  //
+  // 예전엔 조건 없이 끌어내렸다. typingUser는 상대가 글자를 칠 때마다 바뀌므로,
+  // 방에 누가 타자를 치고 있으면 위로 올려 기록을 읽는 것 자체가 불가능했다.
+  // 스크롤 위치는 사용자의 의도다 — 아래에 붙어 있으면 따라가고, 올려서 뭔가를
+  // 읽는 중이면 건드리지 않는다.
+  const stickToBottom = useRef(true);
+  const prevTop = useRef(0);
+
+  // 떼어낼지는 '위로 올라간 이동'에서만 판단한다.
+  //
+  // "지금 바닥 근처인가"만 보면 안 된다. scroll 이벤트는 즉시가 아니라 나중에
+  // 전달되는데, 그 사이 새 메시지가 도착해 내용이 이미 더 길어져 있을 수 있다.
+  // 그러면 방금 우리가 바닥으로 내려놓고서도 "바닥에서 멀다"는 측정값이 나와
+  // 스스로 따라가기를 놓아버린다. 우리가 만드는 이동은 언제나 아래쪽이므로,
+  // 위로 간 경우에만 판단하면 그 오검출이 통과하지 못한다.
+  // (문서 Q&A 쪽 Chat.tsx도 같은 이유로 같은 방식을 쓴다)
+  const handleScroll = () => {
+    const el = listRef.current;
+    if (!el || el.clientHeight === 0) return;
+    const top = el.scrollTop;
+    const nearBottom = el.scrollHeight - top - el.clientHeight <= 80;
+    if (top < prevTop.current) stickToBottom.current = nearBottom;
+    else if (nearBottom) stickToBottom.current = true;
+    prevTop.current = top;
+  };
+
   useEffect(() => {
     const el = listRef.current;
-    if (el) el.scrollTop = el.scrollHeight;
+    if (el && stickToBottom.current) {
+      el.scrollTop = el.scrollHeight;
+      prevTop.current = el.scrollTop;
+    }
   }, [items, typingUser]);
 
   function send(e: FormEvent) {
     e.preventDefault();
     const text = input.trim();
     if (!text) return;
+
+    // 끊긴 상태에서는 보내지 않는다.
+    //
+    // 그냥 emit하면 socket.io가 버퍼에 담아뒀다가 재연결 직후 흘려보내는데,
+    // 그 시점의 서버 소켓은 아직 hello를 못 받아 닉네임도 방도 없다. 서버는
+    // 그 메시지를 조용히 버리고, 화면에는 입력창이 비워진 것만 남는다 —
+    // 보낸 줄 알았던 말이 아무 데도 없는 상태가 된다.
+    // 버리더라도 입력한 글은 남겨서 다시 보낼 수 있게 한다.
+    if (!connected) {
+      setUploadError("연결이 끊겨 있어요. 다시 연결되면 보내주세요.");
+      return;
+    }
+
     socket.emit("message", { text });
     setInput("");
   }
@@ -161,13 +217,31 @@ export default function Room({ nickname, room, error, onDismissError, onLeave }:
 
   function handleChange(value: string) {
     setInput(value);
-    socket.emit("typing"); // 내가 입력 중이라고 방에 알림
+
+    // 입력 중 알림은 초당 한 번으로 묶는다.
+    //
+    // 글자마다 보내면 방 인원수만큼 곱해져 나가는 것도 문제지만, 더 큰 문제는
+    // 서버의 동작 버킷(join·방 삭제·취소와 공용, 초당 10개)을 타자만으로 비운다는
+    // 것이다. 그 버킷이 비면 다음에 누른 "방 삭제"나 "취소"가 조용히 무시된다 —
+    // 확인 창까지 눌렀는데 아무 일도 안 일어난다.
+    // 어차피 상대 화면에서는 1.5초간 유지되는 표시라 초당 한 번이면 충분하다.
+    const now = Date.now();
+    if (now - lastTypingSent.current < 1000) return;
+    lastTypingSent.current = now;
+    socket.emit("typing");
   }
 
   // 이미지를 보내는 유일한 경로. 파일 선택·붙여넣기·드래그앤드롭이 전부 여기로 온다.
   async function sendImage(file: File): Promise<void> {
     if (uploading) return;
     setUploadError(null);
+
+    // 텍스트와 같은 이유(send 참고). 여기서는 더 아깝다 — 업로드까지 끝낸 뒤
+    // 소켓 메시지만 버려지면, DB에는 아무도 못 보는 이미지가 남는다.
+    if (!connected) {
+      setUploadError("연결이 끊겨 있어요. 다시 연결되면 보내주세요.");
+      return;
+    }
 
     // 서버도 검사하지만, 2MB짜리를 다 올려보내고 나서 거절당하는 건 낭비다.
     if (file.size > MAX_IMAGE_BYTES) {
@@ -210,6 +284,12 @@ export default function Room({ nickname, room, error, onDismissError, onLeave }:
     if (file) void sendImage(file);
   }
 
+  // 닉네임이 아니라 authorId로 비교한다. 닉네임은 아무나 같은 값을 쓸 수 있어서,
+  // 예전에는 나와 이름이 같은 사람의 메시지가 내 것으로 보이고 취소 버튼까지
+  // 붙었다(서버가 막아주긴 했다). 보이는 이름과 권한의 근거를 분리한 결과다.
+  const isMine = (msg: ChatMessage): boolean =>
+    authorId !== null && msg.authorId === authorId;
+
   const banner = uploadError ?? error;
 
   return (
@@ -233,7 +313,7 @@ export default function Room({ nickname, room, error, onDismissError, onLeave }:
       </header>
 
       <div className="room-body">
-        <div className="messages" ref={listRef}>
+        <div className="messages" ref={listRef} onScroll={handleScroll}>
           {items.length === 0 && (
             <div className="room-quiet">아직 대화가 없어요. 먼저 말을 걸어보세요.</div>
           )}
@@ -246,10 +326,10 @@ export default function Room({ nickname, room, error, onDismissError, onLeave }:
               <Bubble
                 key={it.msg.id}
                 msg={it.msg}
-                mine={it.msg.nickname === nickname}
+                mine={isMine(it.msg)}
                 // 취소 버튼은 내 것에만 붙인다. 남의 메시지에 달아도 서버가
                 // 거절하지만, 눌러서 거절당할 버튼을 보여줄 이유가 없다.
-                onCancel={it.msg.nickname === nickname ? () => cancelMessage(it.msg) : undefined}
+                onCancel={isMine(it.msg) ? () => cancelMessage(it.msg) : undefined}
               />
             )
           )}

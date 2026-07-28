@@ -53,6 +53,9 @@ function statusOf(e: unknown): number | undefined {
 // 대부분 성공한다. 반대로 400/404 같은 건 재시도해도 소용없으니 바로 던진다.
 const RETRYABLE = new Set([429, 500, 503, 504]);
 
+// 외부 호출 하나가 매달릴 수 있는 최대 시간.
+const STREAM_TIMEOUT_MS = Number(process.env.LLM_TIMEOUT_MS || 60_000);
+
 async function withRetry<T>(fn: () => Promise<T>, label: string): Promise<T> {
   const delays = [500, 1000, 2000];
   for (let attempt = 0; ; attempt++) {
@@ -64,8 +67,13 @@ async function withRetry<T>(fn: () => Promise<T>, label: string): Promise<T> {
       // 남은 시도 횟수를 따로 세지 않고 배열 하나로 두 조건을 함께 표현한다.
       const wait = delays[attempt];
       if (status === undefined || !RETRYABLE.has(status) || wait === undefined) throw e;
-      console.warn(`${label} ${status} - ${wait}ms 후 재시도 (${attempt + 1}/${delays.length})`);
-      await new Promise((r) => setTimeout(r, wait));
+      // 대기에 지터(무작위 흔들기)를 섞는다.
+      // 없으면 같은 순간 실패한 요청들이 정확히 같은 시각에 함께 재시도해서,
+      // 이제 막 살아나려는 API를 8건이 동시에 다시 두들긴다(thundering herd).
+      // 재시도의 목적은 "부하를 흩는 것"이기도 하다.
+      const jittered = wait / 2 + Math.random() * wait;
+      console.warn(`${label} ${status} - ${Math.round(jittered)}ms 후 재시도 (${attempt + 1}/${delays.length})`);
+      await new Promise((r) => setTimeout(r, jittered));
     }
   }
 }
@@ -114,7 +122,8 @@ export async function embedQuery(text: string): Promise<number[]> {
 
 export async function streamAnswer(
   question: string,
-  contexts: RetrievedChunk[]
+  contexts: RetrievedChunk[],
+  signal?: AbortSignal
 ): Promise<AsyncIterable<AnswerChunk>> {
   const contextBlock = contexts
     .map((c, i) => `[${i + 1}] (출처: ${c.filename})\n${c.content}`)
@@ -147,8 +156,22 @@ ${contextBlock}
 
   // 스트림을 여는 것까지만 재시도한다. 일단 토큰이 흘러나오기 시작하면
   // (chat.ts에서 for await로 소비) 중간에 재시도할 수 없다.
+  //
+  // abortSignal과 timeout을 같이 준다.
+  // - abortSignal: 사용자가 떠나면 상류 생성을 실제로 끊는다. 우리 쪽 for await를
+  //   빠져나오는 것만으로는 이미 열린 응답이 닫히지 않아 생성이 끝까지 돌고
+  //   토큰이 과금된다.
+  // - timeout: 상류가 응답도 오류도 주지 않고 멎는 경우를 막는다. 이게 없으면
+  //   기본값(약 300초)까지 매달리는데, 그동안 처리 슬롯 하나가 묶인다.
+  //   슬롯 8개가 그렇게 묶이면 아무것도 "실패"하지 않은 채로 전원이 429를 받고,
+  //   실패가 없으니 회로도 안 열린다 — 가장 알아채기 어려운 형태의 마비다.
   return withRetry(
-    () => ai.models.generateContentStream({ model: CHAT_MODEL, contents: prompt }),
+    () =>
+      ai.models.generateContentStream({
+        model: CHAT_MODEL,
+        contents: prompt,
+        config: { abortSignal: signal, httpOptions: { timeout: STREAM_TIMEOUT_MS } },
+      }),
     "생성"
   );
 }

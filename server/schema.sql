@@ -69,3 +69,8 @@ create table if not exists query_logs (
   latency_ms int,
   created_at timestamptz not null default now()
 );
+
+-- 임계값 튜닝은 "최근 로그"를 보는 일이라 항상 created_at으로 정렬·필터한다.
+-- 이 테이블은 질문마다 한 줄씩 영원히 쌓이는 유일한 테이블이므로,
+-- 인덱스가 없으면 시간이 갈수록 그 조회가 느려진다.
+create index if not exists query_logs_created_at_idx on query_logs (created_at desc);

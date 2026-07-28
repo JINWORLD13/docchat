@@ -50,7 +50,9 @@ export class TokenBuckets {
     }
 
     // 지난 시간만큼 토큰을 채운다 (최대 capacity까지)
-    const elapsedSec = (now - bucket.last) / 1000;
+    // 음수를 막는 이유: 시계는 뒤로 갈 수 있다(NTP 보정). 그대로 두면 경과
+    // 시간이 음수가 되어 토큰을 오히려 깎고, retryAfter도 부풀려 안내한다.
+    const elapsedSec = Math.max(0, now - bucket.last) / 1000;
     bucket.tokens = Math.min(this.#capacity, bucket.tokens + elapsedSec * this.#refillPerSec);
     bucket.last = now;
 

@@ -40,7 +40,9 @@ import {
 } from "./rooms.ts";
 import { allowMessage, allowAction, addSocket, removeSocket } from "./ratelimit.ts";
 import { readString } from "./payload.ts";
-import { ALLOWED_ORIGINS } from "../origins.ts";
+import { isAllowedOrigin } from "../origins.ts";
+import { clientIp } from "../clientip.ts";
+import { authorIdOf, anonymousKey, MAX_CLIENT_KEY } from "./identity.ts";
 
 const MAX_NICK = 20;
 const MAX_ROOM = 30;
@@ -67,10 +69,26 @@ type ChatSocket = Socket<ClientToServer, ServerToClient, Record<string, never>, 
 export function attachRealtime(httpServer: HttpServer): ChatServer {
   // 제네릭으로 이벤트 계약을 못박는다. 이제 socket.emit/on이 타입 체크된다.
   const io: ChatServer = new Server(httpServer, {
-    // HTTP와 같은 목록을 쓴다(../origins.ts). 한쪽만 잠그면 의미가 없다 —
-    // 예전엔 여기가 "*"라, HTTP를 잠가도 아무 사이트나 소켓으로 붙어 방 목록을
-    // 받아보고 메시지를 보낼 수 있었다.
-    cors: { origin: ALLOWED_ORIGINS },
+    // HTTP와 같은 판정을 쓴다(../origins.ts). 한쪽만 잠그면 의미가 없다.
+    cors: { origin: (origin, cb) => cb(null, isAllowedOrigin(origin)) },
+
+    // cors 옵션만으로는 실제로 아무것도 막지 못한다.
+    //
+    // engine.io는 cors 미들웨어를 헤더 붙이는 용도로만 쓰고, 오리진이 목록에
+    // 없으면 Access-Control-Allow-Origin을 빼고 그냥 next()를 부른다 — 요청은
+    // 그대로 처리된다. 게다가 브라우저는 WebSocket 핸드셰이크에 CORS를 적용하지
+    // 않으므로, transports를 websocket으로 고정한 클라이언트는 검사 자체를
+    // 건너뛴다. 실제로 아무 오리진에서나 붙어 방 목록을 받고 메시지를 보낼 수
+    // 있었다. "cors를 설정했으니 막혔다"고 믿고 있던 자리다.
+    //
+    // allowRequest는 polling이든 websocket 업그레이드든 핸드셰이크 전에 불리므로
+    // 여기서 거절해야 실제로 닫힌다. host를 같이 넘기는 이유는 배포 때문이다 —
+    // 프런트를 같은 오리진에서 서빙하므로 우리 화면의 Origin은 자기 자신이고,
+    // 그건 CORS_ORIGINS 목록에 없다(origins.ts의 isSameOrigin).
+    allowRequest: (req, done) => {
+      const ok = isAllowedOrigin(req.headers.origin, req.headers.host);
+      done(ok ? null : "origin not allowed", ok);
+    },
   });
 
   // 방 목록은 로비에 있는 사람도 봐야 하므로 특정 방이 아니라 전원에게 보낸다.
@@ -115,7 +133,13 @@ export function attachRealtime(httpServer: HttpServer): ChatServer {
   io.on("connection", (socket) => {
     // 제한과 회수의 기준이 되는 값. socket.id는 재연결마다 새로 생겨서
     // 제한의 키로 쓸 수 없다(realtime/ratelimit.ts 참고).
-    const ip = socket.handshake.address || "unknown";
+    //
+    // handshake.address를 그대로 쓰면 안 된다. 그건 TCP 연결의 주소라,
+    // 로드밸런서 뒤에서는 접속자 전원이 프록시 IP 하나로 보인다 —
+    // "IP당" 제한이 "전체 공용" 제한이 되고, IP당 동시 연결 상한 때문에
+    // 11번째 방문자부터 연결이 끊긴다. Express의 trust proxy는 HTTP에만
+    // 적용되므로 소켓 쪽은 같은 계산을 직접 해준다(../clientip.ts).
+    const ip = clientIp(socket.handshake.address, socket.handshake.headers["x-forwarded-for"]);
 
     // IP당 동시 연결 상한. 넘으면 붙자마자 끊는다 — 여기서 막지 않으면
     // 아래의 IP별 제한을 연결 수만큼 곱해서 우회할 수 있다.
@@ -142,11 +166,26 @@ export function attachRealtime(httpServer: HttpServer): ChatServer {
         return;
       }
       socket.data.nickname = nick;
+
+      // 신원은 연결당 한 번만 정한다.
+      //
+      // hello는 닉네임 변경으로도 다시 오는데, 그때마다 신원을 새로 받으면
+      // "메시지를 보낸 뒤 신원을 바꿔 남의 것을 지운다"가 되진 않더라도,
+      // 자기가 방금 보낸 것을 못 지우게 되는 이상한 상태가 만들어진다.
+      // 브라우저가 clientKey를 안 보내면 익명 키를 붙인다 — 이 연결 안에서는
+      // 자기 것을 지울 수 있고, 재연결하면 신원이 바뀐다.
+      if (!socket.data.authorId) {
+        const key = readString(payload, "clientKey").slice(0, MAX_CLIENT_KEY) || anonymousKey();
+        socket.data.clientKey = key;
+        socket.data.authorId = authorIdOf(key);
+        socket.emit("me", socket.data.authorId);
+      }
+
       // 방에 이미 들어가 있는 상태에서 닉네임을 바꾸면, 방 안의 접속자 목록은
       // 입장 시점의 이름을 들고 있다. 새 이름으로 갱신하고 방에 다시 알린다.
-      const { room } = socket.data;
+      const { room, authorId } = socket.data;
       if (room) {
-        addUser(room, socket.id, nick);
+        addUser(room, socket.id, nick, authorId);
         io.to(room).emit("presence", onlineUsers(room));
       }
       socket.emit("rooms", roomList()); // 방금 들어온 사람에게 현재 목록
@@ -155,7 +194,7 @@ export function attachRealtime(httpServer: HttpServer): ChatServer {
     // 2단계: 방 입장. 없는 이름이면 그 자리에서 만들어진다(= 방 생성).
     // 이미 다른 방에 있었다면 먼저 거기서 빠져나온다(방 이동).
     socket.on("join", (payload) => {
-      const { nickname } = socket.data;
+      const { nickname, authorId } = socket.data;
       if (!nickname) {
         socket.emit("chatError", "먼저 닉네임을 정해주세요.");
         return;
@@ -188,7 +227,8 @@ export function attachRealtime(httpServer: HttpServer): ChatServer {
 
       socket.data.room = roomName;
       socket.join(roomName);
-      addUser(roomName, socket.id, nickname);
+      // 없는 방이면 여기서 만들어지고, 이 사람이 방장이 된다(= authorId가 주인).
+      addUser(roomName, socket.id, nickname, authorId);
 
       socket.emit("history", history(roomName)); // 나에게만 최근 기록
       io.to(roomName).emit("presence", onlineUsers(roomName)); // 방 전체에 접속자 목록
@@ -207,8 +247,8 @@ export function attachRealtime(httpServer: HttpServer): ChatServer {
     // 동안 목록에 남는다. 잘못 만든 이름이나 다 끝난 방을 바로 치우는 수단이 없으면
     // 로비가 지저분해지고, 지우고 싶은 대화가 30분간 남는다.
     socket.on("deleteRoom", (payload) => {
-      const { nickname } = socket.data;
-      if (!nickname) {
+      const { nickname, authorId } = socket.data;
+      if (!nickname || !authorId) {
         socket.emit("chatError", "먼저 닉네임을 정해주세요.");
         return;
       }
@@ -218,7 +258,7 @@ export function attachRealtime(httpServer: HttpServer): ChatServer {
       const roomName = readString(payload, "room").trim().slice(0, MAX_ROOM);
       if (!roomName) return;
 
-      const result = deleteRoom(roomName, nickname);
+      const result = deleteRoom(roomName, authorId);
       if (result === "notfound") {
         socket.emit("chatError", "이미 사라진 방이에요.");
         return;
@@ -257,17 +297,27 @@ export function attachRealtime(httpServer: HttpServer): ChatServer {
     // 서버가 id·시각을 붙여 방 전체에 뿌린다. 그 공통 부분만 여기 모아둔다.
     // build가 null을 주면 보낼 게 없다는 뜻.
     const publish = (
-      build: (base: { id: string; room: string; nickname: string; ts: number }) => ChatMessage | null
+      build: (base: {
+        id: string;
+        room: string;
+        nickname: string;
+        authorId: string;
+        ts: number;
+      }) => ChatMessage | null
     ): void => {
-      const { nickname, room } = socket.data;
-      if (!nickname || !room) return; // 로비에 있으면 무시
+      const { nickname, room, authorId } = socket.data;
+      if (!nickname || !room || !authorId) return; // 로비에 있으면 무시
 
       // id와 ts는 서버가 붙인다. 클라이언트 시계는 틀릴 수 있고, 방 전체가
       // 같은 기준으로 정렬되려면 한 곳에서 찍어야 한다.
-      const message = build({ id: randomUUID(), room, nickname, ts: Date.now() });
+      // authorId도 마찬가지로 서버가 붙인다 — 이게 곧 취소 권한이라, 보내는
+      // 쪽이 정하게 두면 남의 이름으로 글을 쓸 수 있다.
+      const message = build({ id: randomUUID(), room, nickname, authorId, ts: Date.now() });
       if (!message) return;
 
-      addMessage(message);
+      // 방이 사라진 뒤 도착한 메시지는 버린다. addMessage가 방을 되살리지
+      // 않으므로(rooms.ts), 여기서 false면 보낼 곳이 없다는 뜻이다.
+      if (!addMessage(message)) return;
       io.to(room).emit("message", message); // 방에 있는 모두에게
     };
 
@@ -331,8 +381,8 @@ export function attachRealtime(httpServer: HttpServer): ChatServer {
     // 이미지는 방 기록에서 빼는 것만으로 끝나지 않는다. 바이트가 DB에 남아 있으면
     // 주소로 계속 열리기 때문에, 아무도 그 사진을 참조하지 않을 때 행까지 지운다.
     socket.on("deleteMessage", (payload) => {
-      const { nickname, room } = socket.data;
-      if (!nickname || !room) return; // 로비에서는 지울 것이 없다
+      const { nickname, room, authorId } = socket.data;
+      if (!nickname || !room || !authorId) return; // 로비에서는 지울 것이 없다
       // 삭제 한 번은 방 전체로 나가는 1:N이다. join·deleteRoom과 같은 버킷.
       if (!allowedAction()) return;
 
@@ -340,7 +390,7 @@ export function attachRealtime(httpServer: HttpServer): ChatServer {
       const messageId = readString(payload, "messageId");
       if (!UUID.test(messageId)) return;
 
-      const result = removeMessage(room, messageId, nickname);
+      const result = removeMessage(room, messageId, authorId);
       if (result.status === "notfound") {
         socket.emit("chatError", "이미 사라진 메시지예요.");
         return;
