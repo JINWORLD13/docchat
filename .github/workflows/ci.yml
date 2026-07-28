@@ -1,0 +1,57 @@
+# 푸시와 PR마다 검사를 돌린다.
+#
+# 왜 넣었나: 이 저장소가 실제로 놓쳤던 것들은 "문서에는 막았다고 적어뒀는데
+# 코드에서는 풀려 있던" 동작들이었다(RELIABILITY.md 2·4·9번). 그걸 다시
+# 잠그면서 테스트로 고정해뒀는데, 그 테스트가 내 손으로만 도는 한 같은 일이
+# 또 일어난다. 고정한 동작이 계속 고정돼 있는지는 사람이 아니라 CI가 봐야 한다.
+#
+# DB도 API 키도 필요 없다. 여기서 도는 건 전부 외부 의존성 없이 도는
+# 순수 로직 테스트라, 비밀값 없이 포크에서도 그대로 돈다.
+
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  server:
+    name: 서버 (타입 검사 · 테스트)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          # .node-version과 같은 버전을 쓴다. 서버는 빌드 단계 없이 Node가
+          # 타입을 벗겨 실행하므로(type stripping), 그 기능이 있는 버전이어야 한다.
+          node-version-file: .node-version
+          cache: npm
+          cache-dependency-path: server/package-lock.json
+      - run: npm ci
+        working-directory: server
+      - run: npm run typecheck
+        working-directory: server
+      - run: npm test
+        working-directory: server
+
+  web:
+    name: 프런트 (타입 검사 · 린트 · 빌드)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version-file: .node-version
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+      - run: npm ci
+        working-directory: web
+      - run: npx tsc -b
+        working-directory: web
+      - run: npx oxlint
+        working-directory: web
+      # 빌드까지 도는 이유: 타입 검사만으로는 번들 단계에서 나는 문제
+      # (import 경로, 환경변수 참조)를 못 잡는다. 배포가 하는 일과 같은 것을 한다.
+      - run: npm run build
+        working-directory: web

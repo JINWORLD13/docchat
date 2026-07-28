@@ -2,6 +2,8 @@
 
 # DocChat
 
+[![CI](https://github.com/JINWORLD13/docchat/actions/workflows/ci.yml/badge.svg)](https://github.com/JINWORLD13/docchat/actions/workflows/ci.yml)
+
 **[라이브 데모 →](https://docchat-izxf.onrender.com)** (Render 무료 티어라 한동안 요청이
 없으면 서버가 잠들고, 첫 접속 시 깨어나느라 최대 1분 정도 걸릴 수 있음)
 
@@ -91,9 +93,9 @@ HNSW 인덱스로 검색함. 문서 메타데이터랑 벡터를 한 DB에서 �
 
 Rate Limiter(Token Bucket), Admission Control(동시 상한 + 대기 데드라인),
 Bulkhead(읽기·쓰기·미디어 세 풀로 격리 — 이미지 조회가 질문 응답을 굶기지 않게),
-Circuit Breaker, Graceful Degradation을 직접 구현했음. 병목은 추측하지 않고
-부하를 걸어 측정했고(LLM이 아니라 DB 풀이었음), 각 레이어의 동작을 단위
-테스트로 고정했음. (`cd server && npm test` — 61개)
+Circuit Breaker(임베딩·생성 각각), Graceful Degradation을 직접 구현했음. 병목은
+추측하지 않고 부하를 걸어 측정했고(LLM이 아니라 DB 풀이었음), 각 레이어의
+동작을 단위 테스트로 고정했음. (`cd server && npm test` — 96개)
 
 설계 근거·대안 비교·측정값은 [RELIABILITY.md](RELIABILITY.md)에 정리했음.
 
@@ -107,6 +109,16 @@ Circuit Breaker, Graceful Degradation을 직접 구현했음. 병목은 추측�
 만들어지고, 마지막 사람이 나가면서 대화 기록도 없으면 목록에서 사라짐. 빈 방을
 남겨두면 한 번 쓴 이름이 영원히 쌓이는데, 치워줄 사람이 없는 구조라 스스로
 정리되는 쪽을 택했음.
+
+**보이는 이름과 권한의 근거를 나눴음.** 방 삭제와 "보낸 것 취소"는 되돌릴 수
+없는 동작인데(취소한 게 이미지면 DB의 바이트까지 지움), 처음엔 그 권한을
+닉네임으로 판단했음. 닉네임은 말풍선·접속자 목록·방 목록으로 전부 공개되고
+닉네임 등록은 언제든 다시 보낼 수 있으니, 남의 이름을 그대로 적어 보내면 남의
+방을 지우고 남이 올린 사진을 모두에게서 없앨 수 있었음. 그래서 브라우저가 보관하는
+비밀값(clientKey)을 서버가 HMAC한 값을 신원으로 쓰고, 공개되는 건 그 HMAC 결과뿐임.
+화면은 그 값으로 "내 것"을 판단하고 서버는 같은 값으로 권한을 확인함 — 남의 것을
+봐도 흉내낼 수 없음. 로그인이 아니라 "이 탭" 수준의 신원이지만, 이름을 적어
+보내는 것과는 다름.
 
 문서 Q&A와 같은 서버·같은 포트(4000)를 씀. 나누지 않은 이유는 전송 방식이 다를
 뿐 운영해야 할 프로세스를 늘릴 이유는 없기 때문임. 합치고 나니 오히려 중복이
@@ -200,11 +212,16 @@ npm run dev   # http://localhost:5173
 루프백이라 비워두면 됨. 이 값을 채워 배포하면 번들에 평문으로 들어가 방문자
 누구나 읽을 수 있다는 점만 유의할 것(파일의 주의 사항 참고).
 
-`sample-docs/`의 문서 두 개를 올리고 이렇게 물어보면 됨.
+`sample-docs/`의 문서 세 개를 올리고 이렇게 물어보면 됨.
 
 - "환불은 며칠 걸려?" → 문서 근거로 답변 + 출처 표시
 - "반품 배송비는 누가 부담해?" → 조건별로 나눠서 답변
+- "가상계좌로 주문했는데 입금 기한이 언제까지야?" → 긴 문서에서 해당 조각만 찾아옴
 - "프랑스의 수도는?" → 거절 (문서에 없는 내용)
+
+앞의 두 문서는 짧아서 청크가 하나씩만 나옴. 겹치는 청킹이 실제로 갈라지는 걸
+보려면 세 번째 문서(`자주-묻는-질문.md`, 어절 470개 → 청크 3개)를 올려서
+목록의 청크 수를 보면 됨.
 
 실시간 채팅은 상단 "실시간 채팅" 탭에서 확인함. 브라우저 탭을 두 개 열고 같은
 방 이름으로 들어가면 서로 대화가 오감. 텍스트 대화는 DB 없이도 되고, 이미지
@@ -231,8 +248,10 @@ server/
   images.ts           채팅 이미지 저장/조회 (DB를 아는 코드를 여기 가둠)
   tokenbucket.ts      Token Bucket 알고리즘 — HTTP·소켓 제한이 공유
   ratelimit.ts        사용자(IP)별 HTTP 요청 제한
+  clientip.ts         프록시 뒤에서 진짜 클라이언트 IP 고르기 (소켓용)
+  origins.ts          오리진 허용 판정 — HTTP·소켓·CSRF 검사가 공유
   admission.ts        동시 처리 상한 + 대기 데드라인 (load shedding)
-  breaker.ts          LLM 회로 차단기
+  breaker.ts          회로 차단기 — 임베딩용·생성용 두 개
   admin.ts            장애 주입 엔드포인트 보호 (토큰 / 루프백)
   faults.ts           런타임 장애 주입 스위치 (데모용)
   routes/
@@ -243,13 +262,15 @@ server/
     types.ts          소켓 이벤트 계약 (web와 짝)
     gateway.ts        연결·입장·브로드캐스트·퇴장 핸들러
     rooms.ts          방 상태 (메시지 50개 + 접속자) 메모리
-    ratelimit.ts      소켓별 도배 제한
+    ratelimit.ts      IP별 도배 제한 (연결이 끊겨도 예산은 남음)
+    identity.ts       표시용 닉네임과 권한용 신원을 분리 (HMAC)
   scripts/            부하 테스트, 캐시 벤치, 방어 레이어 시연
   schema.sql
   tsconfig.json       빌드 없음 — Node가 타입을 벗겨 실행, tsc는 검사만
-  *.test.ts           단위 테스트 61개
+  *.test.ts           단위 테스트 96개
                       (청킹·token bucket·rate limit·breaker·admission·rooms
-                       ·imagetype)
+                       ·imagetype·소켓 페이로드·클라이언트 IP·오리진 판정
+                       ·소켓 도배 제한)
 web/
   src/
     types.ts          서버와 맞춘 계약 (문서·SSE 이벤트·metrics)
@@ -265,9 +286,10 @@ web/
       RoomList.tsx    방 목록 + 새 방 만들기
       Room.tsx        구독·전송·접속자 목록
   vite.config.ts      /api 프록시 + /socket.io 프록시(ws)
-sample-docs/          데모용 가상 쇼핑몰 문서
+sample-docs/          데모용 가상 쇼핑몰 문서 (짧은 것 둘 + 청킹이 갈라지는 것 하나)
 docs/                 README·포트폴리오용 스크린샷
 docker-compose.yml    pgvector 포함 Postgres
+.github/workflows/    CI — 푸시·PR마다 타입 검사·테스트·빌드
 ```
 
 문서 목록에서 항목을 누르면 팝업이 뜨고, 원문을 그 자리에서 고쳐 저장할 수 있음.
@@ -282,14 +304,14 @@ docker-compose.yml    pgvector 포함 Postgres
   검색을 다음에 시도해보고 싶음.
 - 거절 임계값을 로그를 보며 수동으로 조정하고 있는데, 평가용 질문 세트를
   만들어서 자동으로 측정하는 게 다음 목표임.
-- 클라이언트가 응답 도중 떠나도 서버는 LLM 스트림을 끝까지 소비함.
-  연결 종료(close) 이벤트를 감지해 생성을 중단하는 것이 다음 개선 후보임.
 - 채팅 기록이 서버 메모리에만 있어서 서버가 재시작하면 사라짐. 단계별로는
   ① 지금: 단일 서버 인메모리(방·메시지·presence·도배 방지) → ② 메시지를
   Postgres에 남겨 durability 확보 → ③ Socket.IO Redis 어댑터로 pub/sub을 붙이고
   presence를 Redis로 옮겨, 다른 서버에 붙은 사용자에게도 메시지가 가게 하는
   순서를 생각하고 있음. 임베딩 캐시가 인메모리인 것과 같은 성격의 한계임.
-- 채팅에 로그인이 없어 닉네임을 아무나 쓸 수 있음.
+- 채팅에 로그인이 없음. 닉네임은 아무나 같은 값을 쓸 수 있고(표시용일 뿐),
+  권한은 브라우저에 보관한 키에서 나오므로 그 탭을 벗어나면 이어지지 않음.
+  다른 기기에서 같은 사람임을 증명하려면 계정이 필요함.
 - 서버와 프런트가 이벤트 계약 타입을 각자 복사해 갖고 있음. 지금 규모에선
   워크스페이스를 도입하는 비용이 더 커서 미뤘고, 커지면 공용 패키지로 뺄 계획임.
 - 배포: Neon(pgvector 지원) + Render 무료 티어. 프런트(React 빌드 결과)와
