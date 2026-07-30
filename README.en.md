@@ -105,11 +105,11 @@ with 40 words of overlap. It's a pure function, so it has tests.
 ### Designing for overload and failure
 
 I implemented Rate Limiter (Token Bucket), Admission Control (concurrency cap +
-wait deadline), Bulkhead (three pools — read, write, media — so image fetches don't
-starve question answering), Circuit Breaker (one for embedding, one for
-generation), and Graceful Degradation myself. I didn't guess at the bottleneck; I
-put load on it and measured (it was the DB pool, not the LLM), and pinned each
-layer's behavior with unit tests. (`cd server && npm test` — 96 of them)
+wait deadline), Bulkhead (three connection pools — readPool, writePool, mediaPool —
+so image fetches don't starve question answering), Circuit Breaker (one for
+embedding, one for generation), and Graceful Degradation myself. I didn't guess at
+the bottleneck; I put load on it and measured (it was the DB pool, not the LLM), and
+pinned each layer's behavior with unit tests. (`cd server && npm test` — 96 of them)
 
 The reasoning, the alternatives I compared, and the numbers are in
 [RELIABILITY.en.md](RELIABILITY.en.md).
@@ -201,11 +201,12 @@ retrying can't fix — 400, 404 — go straight to the user instead.
 ## Stack
 
 - Language: TypeScript (server and frontend both)
-- Frontend: React (Vite)
+- Frontend: React (Vite) · SSE (receiving the streamed answer)
 - Backend: Node.js + Express + Socket.IO
 - DB: PostgreSQL + pgvector
 - AI: Gemini API — `gemini-embedding-001` (embedding) + `gemini-3.6-flash`
   (generation), runs on the free tier
+- Infra: Docker (local pgvector) · Render (deployment) · GitHub Actions (CI)
 
 ## Running it
 
@@ -357,6 +358,9 @@ chunks (they overlap), so it's kept separately in `documents.content`.
 - The server and the frontend each keep their own copy of the event contract types.
   At this size the cost of introducing a workspace is higher than the duplication,
   so I deferred it; if it grows I'll pull them into a shared package.
+- Verification is still at the unit-test level. Behavior like socket origins or
+  CSRF only shows up with a server actually running, and I reproduced those by
+  hand; lifting them into integration tests is the next candidate.
 - Deployment: Neon (pgvector support) + Render free tier. The frontend (the React
   build output) and the backend are served from a single Render service — web/api.ts
   and realtime/socket.ts assume relative paths and the same origin, so splitting the

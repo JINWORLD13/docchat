@@ -92,10 +92,11 @@ HNSW 인덱스로 검색함. 문서 메타데이터랑 벡터를 한 DB에서 �
 ### 과부하와 장애를 견디는 설계
 
 Rate Limiter(Token Bucket), Admission Control(동시 상한 + 대기 데드라인),
-Bulkhead(읽기·쓰기·미디어 세 풀로 격리 — 이미지 조회가 질문 응답을 굶기지 않게),
-Circuit Breaker(임베딩·생성 각각), Graceful Degradation을 직접 구현했음. 병목은
-추측하지 않고 부하를 걸어 측정했고(LLM이 아니라 DB 풀이었음), 각 레이어의
-동작을 단위 테스트로 고정했음. (`cd server && npm test` — 96개)
+Bulkhead(커넥션 풀을 readPool·writePool·mediaPool 셋으로 격리 — 이미지 조회가
+질문 응답을 굶기지 않게), Circuit Breaker(임베딩·생성 각각), Graceful
+Degradation을 직접 구현했음. 병목은 추측하지 않고 부하를 걸어 측정했고(LLM이
+아니라 DB 풀이었음), 각 레이어의 동작을 단위 테스트로 고정했음.
+(`cd server && npm test` — 96개)
 
 설계 근거·대안 비교·측정값은 [RELIABILITY.md](RELIABILITY.md)에 정리했음.
 
@@ -173,10 +174,11 @@ Socket.IO를 제네릭으로 감싸 `emit`/`on`의 이름과 payload를 컴파�
 ## 기술 스택
 
 - 언어: TypeScript (서버·프런트 모두)
-- 프론트: React (Vite)
+- 프론트: React (Vite) · SSE (답변 스트리밍 수신)
 - 백엔드: Node.js + Express + Socket.IO
 - DB: PostgreSQL + pgvector
 - AI: Gemini API — `gemini-embedding-001`(임베딩) + `gemini-3.6-flash`(생성), 무료 티어로 동작
+- 인프라: Docker (로컬 pgvector) · Render (배포) · GitHub Actions (CI)
 
 ## 실행 방법
 
@@ -219,9 +221,9 @@ npm run dev   # http://localhost:5173
 - "가상계좌로 주문했는데 입금 기한이 언제까지야?" → 긴 문서에서 해당 조각만 찾아옴
 - "프랑스의 수도는?" → 거절 (문서에 없는 내용)
 
-앞의 두 문서는 짧아서 청크가 하나씩만 나옴. 겹치는 청킹이 실제로 갈라지는 걸
-보려면 세 번째 문서(`자주-묻는-질문.md`, 어절 470개 → 청크 3개)를 올려서
-목록의 청크 수를 보면 됨.
+앞의 두 문서는 짧아서(어절 176개, 184개) 청크가 하나씩만 나옴. 겹치는 청킹이
+실제로 갈라지는 걸 보려면 세 번째 문서(`자주-묻는-질문.md`, 어절 470개 →
+청크 3개)를 올려서 목록의 청크 수를 보면 됨.
 
 실시간 채팅은 상단 "실시간 채팅" 탭에서 확인함. 브라우저 탭을 두 개 열고 같은
 방 이름으로 들어가면 서로 대화가 오감. 텍스트 대화는 DB 없이도 되고, 이미지
@@ -314,6 +316,9 @@ docker-compose.yml    pgvector 포함 Postgres
   다른 기기에서 같은 사람임을 증명하려면 계정이 필요함.
 - 서버와 프런트가 이벤트 계약 타입을 각자 복사해 갖고 있음. 지금 규모에선
   워크스페이스를 도입하는 비용이 더 커서 미뤘고, 커지면 공용 패키지로 뺄 계획임.
+- 검증이 아직 단위 테스트 수준임. 소켓 오리진·CSRF처럼 서버를 실제로 띄워야
+  확인되는 동작은 지금 손으로 재현해 확인했고, 이걸 통합 테스트로 올리는 게
+  다음 후보임.
 - 배포: Neon(pgvector 지원) + Render 무료 티어. 프런트(React 빌드 결과)와
   백엔드를 같은 Render 서비스 하나로 합쳐서 서빙함 — web/api.ts와
   realtime/socket.ts가 상대경로·같은 오리진을 가정하고 있어서, 프런트만

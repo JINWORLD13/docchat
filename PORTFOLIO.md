@@ -6,9 +6,11 @@
 문서에 없는 질문은 지어내지 않고 거절하며, 답변마다 근거 출처를 표시함.
 여러 명이 같은 방에서 대화하는 실시간 채팅을 같은 서버에 함께 얹었음.
 
+- 개발 기간: 2026.06 ~ 2026.07
+- 개발 인원: 1인 (설계 · 개발 · 테스트 · 문서화)
 - 저장소: https://github.com/JINWORLD13/docchat
 - 스택: TypeScript · React (Vite) · Node/Express · PostgreSQL + pgvector ·
-  Socket.IO · Gemini API
+  Socket.IO · Gemini API · Docker
 - 로컬 실행: 아래 [실행](#실행) 세 단계
 
 ---
@@ -134,6 +136,27 @@ HTTP 서버 하나에 Socket.IO를 붙여 포트·배포·CORS를 하나로 유�
 공유함. 합치고 나서야 중복이 드러났음 — HTTP 요청 제한과 채팅 도배 제한이 같은
 Token Bucket을 각자 복사해 갖고 있었음. 이걸 server/tokenbucket.ts 하나로 뽑아
 양쪽이 공유하고 값만 다르게 줌(HTTP는 용량 10·초당 5개 충전, 채팅은 5·2).
+
+값을 다르게 준 기준은 "요청이 얼마나 비싼가"가 아니라 "넘쳤을 때 피해가 어디까지
+번지는가"임. 비용만 보면 임베딩·생성이 붙는 HTTP 질문 쪽이 훨씬 비싼데도 채팅
+버스트를 더 좁게 잡았음 — HTTP 도배는 자기 요청이 429로 막히고 끝이지만, 한 명의
+채팅 도배는 같은 방 사람들 화면을 전부 덮음.
+
+하나로 감당되는 이유는 이 서버가 하는 일이 대부분 기다리는 일이기 때문임. 무거운
+계산(임베딩·벡터 검색·생성)은 전부 다른 컴퓨터에서 돌고 Node는 결과를 기다림.
+열려 있는 SSE와 소켓도 그동안 CPU를 쓰지 않고 파일 디스크립터와 약간의 메모리만
+차지함. 그래서 프로세스를 늘려도 늘어나는 게 없음 — 기다림을 나눠서 기다릴 뿐임.
+전제가 깨지는 조건도 분명함. 이벤트 루프를 실제로 붙잡는 동기 작업이 들어오면 그
+순간 모든 연결이 함께 멈추므로, PDF 파싱이나 이미지 변환을 넣는다면 그때는 워커나
+프로세스 분리가 필요해짐. 지금 CPU를 쓰는 건 이미지 앞머리 몇 바이트 비교와 청킹의
+문자열 분할 정도임.
+
+대신 값을 치렀음. 프로세스가 하나면 장애도 하나라서, 아래 소켓 페이로드 한 줄로
+프로세스가 죽었을 때 함께 죽은 건 채팅만이 아니라 문서 Q&A였음. 그래서 격리를
+프로세스가 아니라 그 안에서 만들었음 — 커넥션 풀을 읽기·쓰기·미디어로 나눈
+Bulkhead(readPool·writePool·mediaPool)가 그것임. 프로세스를 나누는 것과 자원을
+격리하는 것은 다른 축이고, 후자는 한 프로세스 안에서도 할 수 있음.
+
 나눠야 할 때는 두 트래픽의 규모가 크게 달라져 각각 독립적으로 스케일해야 할 때임.
 
 버킷의 키를 socket.id로 잡았다가 갈아엎었고, 그다음에 한 번 더 갈아엎었음.
@@ -180,6 +203,8 @@ id가 자기가 발급한 것인지 확인한 뒤에야 주소를 붙임. 저장
 bytea로 하고, 조회는 읽기 풀이 아니라 전용 풀(mediaPool)로 격리했음. 이미지 조회는
 메시지가 화면에 뜰 때마다 나가는 잦고 무거운 읽기라, 질문 검색용 읽기 풀에 태우면
 사진 많은 방 하나가 이 프로젝트가 "사수하겠다"고 말한 경로를 굶기기 때문임.
+이미지는 `id`가 uuid이고 내용이 바뀌지 않으므로 불변 캐시 헤더를 줄 수 있어,
+DB까지 오는 건 각 이미지의 첫 요청뿐임.
 
 TypeScript, 빌드 단계 없이.
 서버·프런트를 전부 TypeScript로 옮기되 빌드 산출물은 만들지 않았음. Node 24가
@@ -355,7 +380,10 @@ Socket.IO가 리스너를 try/catch 없이 부르는 탓에 프로세스가 통�
 const topSimilarity = rows[0]?.similarity ?? 0;
 
 if (rows.length === 0 || topSimilarity < THRESHOLD) {
-  send({ type: "refusal", message: "문서에서 관련 내용을 찾지 못했어요" });
+  send({
+    type: "refusal",
+    message: "업로드된 문서에서 관련 내용을 찾지 못했어요. 질문을 바꿔보시거나 관련 문서를 올려주세요.",
+  });
   res.end();          // 여기서 끝 — AI를 부르지도 않는다
   return;
 }
@@ -387,17 +415,22 @@ for (let start = 0; start < words.length; start += step) {
 ```ts
 // 클라이언트 → 서버 (서버가 듣는 이벤트)
 export interface ClientToServer {
-  hello: (payload: { nickname: string }) => void; // 닉네임 등록 → 로비 진입
+  // 닉네임 등록 → 로비 진입. clientKey는 브라우저가 만들어 보관하는 비밀값 —
+  // 재연결해도 같은 값이라야 자기가 만든 방을 계속 지울 수 있다(위 4번의 신원).
+  hello: (payload: { nickname: string; clientKey?: string }) => void;
   join: (payload: { room: string }) => void;      // 방 입장 (없으면 생성) / 방 이동
   leave: () => void;                              // 방만 나가고 로비로
+  deleteRoom: (payload: { room: string }) => void; // 방 삭제 (방장만)
   message: (payload: { text: string }) => void;
   image: (payload: { imageId: string }) => void;  // 바이트가 아니라 id만 (아래 이미지 항목)
+  deleteMessage: (payload: { messageId: string }) => void; // 내가 보낸 것 취소
   typing: () => void;
 }
 // hello와 join을 나눈 이유: 닉네임은 로비에서 한 번 정하고, 방은 그 뒤로 몇 번이든
 // 옮겨 다닌다. 한 이벤트에 묶으면 방을 옮길 때마다 닉네임을 다시 실어 보내게 되고,
 // 그 값이 매번 달라도 서버가 알 길이 없다.
-// (ServerToClient는 rooms / history / message / presence / system / typing / chatError)
+// (ServerToClient는 me / rooms / history / message / messageDeleted / presence /
+//  system / typing / roomClosed / chatError)
 
 // 이 계약을 제네릭으로 넘기면 emit/on의 이름과 payload가 타입 검사를 받는다
 const io: Server<ClientToServer, ServerToClient, ..., SocketData> =

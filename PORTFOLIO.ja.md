@@ -6,9 +6,11 @@
 ドキュメントにない質問には作り話をせず拒否し、回答ごとに根拠の出典を表示する。複数人が
 同じ部屋で会話するリアルタイムチャットも、同じサーバーに載せている。
 
+- 開発期間: 2026.06 ~ 2026.07
+- 開発人数: 1人 (設計 · 開発 · テスト · ドキュメント)
 - リポジトリ: https://github.com/JINWORLD13/docchat
 - スタック: TypeScript · React (Vite) · Node/Express · PostgreSQL + pgvector ·
-  Socket.IO · Gemini API
+  Socket.IO · Gemini API · Docker
 - ローカル実行: 下記[実行](#実行)の3ステップ
 
 ---
@@ -136,8 +138,30 @@ Postgresに vectorカラムを1つ足すだけなので、メタデータのジ�
 1つに保ち、防御ロジックも共有している。統合して初めて重複が見えた — HTTPリクエスト制限と
 チャットの連投制限が、同じToken Bucketをそれぞれコピーして持っていた。これを
 server/tokenbucket.tsの1箇所に抽出し、両者が共有して値だけを変える(HTTPは
-容量10・毎秒5個補充、チャットは5・2)。分けるべきなのは、2つのトラフィックの規模が
-大きく離れ、それぞれ独立にスケールさせる必要が出たときだ。
+容量10・毎秒5個補充、チャットは5・2)。
+
+値を変えた基準は「リクエストがどれだけ高いか」ではなく「溢れたとき被害がどこまで
+広がるか」だ。コストだけ見れば埋め込み・生成が付くHTTPの質問の方がはるかに高いのに、
+チャットのバーストの方を狭く取った — HTTPの連投は自分のリクエストが429で弾かれて
+終わりだが、一人の連投は同じ部屋にいる人の画面を全部覆ってしまう。
+
+1つで足りる理由は、このサーバーの仕事がほとんど待つ仕事だからだ。重い計算
+(埋め込み・ベクトル検索・生成)はすべて別のコンピューターで回り、Nodeは結果を待つ。
+開いているSSEとソケットもその間CPUを使わず、ファイルディスクリプタと少しのメモリしか
+占めない。だからプロセスを増やしても増えるものがない — 待つことを分けて待つだけだ。
+前提が崩れる条件も明確だ。イベントループを実際に掴む同期処理が入ると、その瞬間すべての
+接続が一緒に止まるので、PDFパースや画像変換を入れるならそのときはワーカーかプロセス
+分離が必要になる。今CPUを使っているのは、画像の先頭数バイトの比較とチャンキングの
+文字列分割くらいだ。
+
+代わりに代償を払っている。プロセスが1つなら障害も1つで、下のソケットのペイロード1行で
+プロセスが死んだとき、一緒に死んだのはチャットだけでなくドキュメントQ&Aだった。そこで
+隔離をプロセスではなくその中に作った — コネクションプールを読み取り・書き込み・メディアに
+分けたBulkhead(readPool・writePool・mediaPool)がそれだ。プロセスを分けることと
+資源を隔離することは別の軸で、後者は1つのプロセスの中でもできる。
+
+分けるべきなのは、2つのトラフィックの規模が大きく離れ、それぞれ独立にスケールさせる
+必要が出たときだ。
 
 バケツのキーをsocket.idにしていたが作り直し、そのあともう一度作り直した。最初はチャットの
 バケツをソケット単位で持ち、disconnect時に`drop()`で正確に回収する方がIPベースより
@@ -185,7 +209,8 @@ socket.idは接続のたびに新しく生まれるので、「5発撃って切�
 読み取りプールではなく専用プール(mediaPool)へ隔離した。画像の取得はメッセージが
 表示されるたびに走る頻繁で重い読み取りなので、質問検索用の読み取りプールに載せると、
 写真の多い部屋ひとつがこのプロジェクトが「死守する」と言った経路を
-飢えさせてしまうからだ。
+飢えさせてしまうからだ。画像は`id`がuuidで内容が変わらないため不変キャッシュヘッダを
+付けられ、DBまで届くのは各画像の初回リクエストだけだ。
 
 TypeScriptへ、ビルド段階なしで。サーバー・フロントエンドをすべてTypeScriptへ移したが、
 ビルド成果物は作らない。Node 24が実行時に型だけを剥がす(type stripping)ので
@@ -364,7 +389,12 @@ Token Bucketは`take(key, now)`のように時刻を引数で受け取る形に�
 const topSimilarity = rows[0]?.similarity ?? 0;
 
 if (rows.length === 0 || topSimilarity < THRESHOLD) {
-  send({ type: "refusal", message: "문서에서 관련 내용을 찾지 못했어요" });
+  send({
+    type: "refusal",
+    // 「アップロードされたドキュメントから関連する内容が見つかりませんでした。
+    //  質問を変えるか、関連ドキュメントをアップロードしてください」
+    message: "업로드된 문서에서 관련 내용을 찾지 못했어요. 질문을 바꿔보시거나 관련 문서를 올려주세요.",
+  });
   res.end();          // ここで終わり — AIを呼びもしない
   return;
 }
@@ -397,17 +427,22 @@ for (let start = 0; start < words.length; start += step) {
 ```ts
 // クライアント → サーバー (サーバーが聞くイベント)
 export interface ClientToServer {
-  hello: (payload: { nickname: string }) => void; // ニックネーム登録 → ロビーへ
+  // ニックネーム登録 → ロビーへ。clientKeyはブラウザが生成して保管する秘密値 —
+  // 再接続しても同じ値だからこそ、自分が作った部屋を消し続けられる(上の4番の身元)。
+  hello: (payload: { nickname: string; clientKey?: string }) => void;
   join: (payload: { room: string }) => void;      // 入室 (なければ作成) / 部屋の移動
   leave: () => void;                              // 部屋だけ出てロビーへ
+  deleteRoom: (payload: { room: string }) => void; // 部屋の削除 (部屋主のみ)
   message: (payload: { text: string }) => void;
   image: (payload: { imageId: string }) => void;  // バイト列ではなくidだけ (下の画像の項)
+  deleteMessage: (payload: { messageId: string }) => void; // 自分が送ったものの取り消し
   typing: () => void;
 }
 // helloとjoinを分けた理由: ニックネームはロビーで一度決め、部屋はその後何度でも
 // 移動する。1つのイベントにまとめると部屋を移るたびにニックネームを載せ直すことになり、
 // その値が毎回違ってもサーバーには知りようがない。
-// (ServerToClientは rooms / history / message / presence / system / typing / chatError)
+// (ServerToClientは me / rooms / history / message / messageDeleted / presence /
+//  system / typing / roomClosed / chatError)
 
 // この契約をジェネリックで渡すと、emit/on の名前とpayloadが型検査を受ける
 const io: Server<ClientToServer, ServerToClient, ..., SocketData> =

@@ -7,9 +7,11 @@ It refuses questions the documents don't cover instead of inventing an answer, a
 shows the sources behind every answer. A real-time chat where several people talk
 in the same room sits on the same server.
 
+- Period: 2026.06 ~ 2026.07
+- Team: solo (design · development · testing · documentation)
 - Repository: https://github.com/JINWORLD13/docchat
 - Stack: TypeScript · React (Vite) · Node/Express · PostgreSQL + pgvector ·
-  Socket.IO · Gemini API
+  Socket.IO · Gemini API · Docker
 - Local run: the three steps under [Running](#running)
 
 ---
@@ -93,7 +95,7 @@ The reasoning and the measurements are in [RELIABILITY.en.md](RELIABILITY.en.md)
      ├─ chat: socket → flood limit (Token Bucket) → broadcast to the room
      │
      ├─ image: HTTP upload → format from leading bytes (SVG excluded) → store
-     │         id only on the socket · server builds the URL · fetch on its own pool
+     │         id only on the socket · server builds the URL · own pool (mediaPool)
      │                                  │
      ├─ ingest: file → chunking (overlap) → embedding → store
      │                                  │
@@ -153,9 +155,33 @@ deployment, and CORS as one thing, and the defense logic is shared. Only after
 merging did the duplication show up — the HTTP request limit and the chat flood
 limit each had their own copy of the same Token Bucket. I pulled it out into
 server/tokenbucket.ts, had both share it, and gave them different values (HTTP is
-capacity 10, refill 5 per second; chat is 5 and 2). The time to split is when the
-two kinds of traffic diverge enough in volume that they need to scale
-independently.
+capacity 10, refill 5 per second; chat is 5 and 2).
+
+The rule behind those numbers isn't "how expensive is the request" but "how far does
+the damage spread when it overflows." By cost alone the HTTP question path is far
+more expensive — it carries embedding and generation — and I still gave chat the
+narrower burst. Flooding over HTTP gets your own requests 429'd and stops there; one
+person flooding a room covers everyone else's screen in it.
+
+One process is enough because most of what this server does is wait. The heavy work
+— embedding, vector search, generation — all runs on other machines, and Node waits
+for the result. Open SSE responses and sockets don't burn CPU while they sit there
+either; they hold a file descriptor and a little memory. So adding processes adds
+nothing — it just splits the waiting. The condition that breaks this assumption is
+equally clear: synchronous work that actually holds the event loop stops every
+connection at once, so adding PDF parsing or image conversion is where a worker or a
+separate process becomes necessary. Today the only CPU work is comparing a few
+leading bytes of an image and splitting strings for chunking.
+
+There's a price. One process means one failure domain: when a single socket payload
+killed the process (below), what died with it wasn't only chat — it was the document
+Q&A. So the isolation was built inside the process rather than between processes —
+the Bulkhead that splits the connection pool into read, write, and media (readPool,
+writePool, mediaPool). Splitting processes and isolating resources are different
+axes, and the second one works inside a single process.
+
+The time to split is when the two kinds of traffic diverge enough in volume that
+they need to scale independently.
 
 I keyed the bucket on socket.id, tore it out, and then tore it out once more.
 At first I gave each socket its own chat bucket and reclaimed it exactly on
@@ -210,7 +236,9 @@ received is one it issued before it attaches a URL. Storage is `bytea` in Postgr
 `chat_images`, and fetching is isolated on a dedicated pool (mediaPool) rather than
 the read pool. Image fetches are frequent, heavy reads that fire every time a
 message renders, so putting them on the question-retrieval read pool lets one
-photo-heavy room starve the exact path this project said it would defend.
+photo-heavy room starve the exact path this project said it would defend. Since the
+`id` is a uuid and the content never changes, they can carry an immutable cache
+header, so only the first request for each image reaches the DB.
 
 TypeScript, with no build step.
 The server and the frontend are both TypeScript, but there's no build output. Node
@@ -401,7 +429,12 @@ The refusal gate — this project's identity (server/routes/chat.ts)
 const topSimilarity = rows[0]?.similarity ?? 0;
 
 if (rows.length === 0 || topSimilarity < THRESHOLD) {
-  send({ type: "refusal", message: "문서에서 관련 내용을 찾지 못했어요" });
+  send({
+    type: "refusal",
+    // "Couldn't find anything relevant in the uploaded documents.
+    //  Try rephrasing, or upload a related document."
+    message: "업로드된 문서에서 관련 내용을 찾지 못했어요. 질문을 바꿔보시거나 관련 문서를 올려주세요.",
+  });
   res.end();          // it ends here — the AI is never called
   return;
 }
@@ -434,18 +467,24 @@ The socket event contract — the device that catches typos at compile time
 ```ts
 // client → server (events the server listens for)
 export interface ClientToServer {
-  hello: (payload: { nickname: string }) => void; // register nickname → enter lobby
+  // register nickname → enter lobby. clientKey is a secret the browser generates
+  // and keeps — it survives reconnects, which is what lets you keep deleting your
+  // own room (the identity from problem 4 above).
+  hello: (payload: { nickname: string; clientKey?: string }) => void;
   join: (payload: { room: string }) => void;      // join a room (created if absent) / switch rooms
   leave: () => void;                              // leave the room only, back to the lobby
+  deleteRoom: (payload: { room: string }) => void; // delete a room (owner only)
   message: (payload: { text: string }) => void;
   image: (payload: { imageId: string }) => void;  // the id, not the bytes (see the image section)
+  deleteMessage: (payload: { messageId: string }) => void; // retract something I sent
   typing: () => void;
 }
 // Why hello and join are separate: the nickname is set once in the lobby, and after that
 // you move between rooms as many times as you like. Bundled into one event, you'd resend
 // the nickname on every room change, and the server would have no way to know if that
 // value changed each time.
-// (ServerToClient is rooms / history / message / presence / system / typing / chatError)
+// (ServerToClient is me / rooms / history / message / messageDeleted / presence /
+//  system / typing / roomClosed / chatError)
 
 // Passing this contract as a generic gets emit/on names and payloads type-checked
 const io: Server<ClientToServer, ServerToClient, ..., SocketData> =
