@@ -96,7 +96,7 @@ Bulkhead(커넥션 풀을 readPool·writePool·mediaPool 셋으로 격리 — �
 질문 응답을 굶기지 않게), Circuit Breaker(임베딩·생성 각각), Graceful
 Degradation을 직접 구현했음. 병목은 추측하지 않고 부하를 걸어 측정했고(LLM이
 아니라 DB 풀이었음), 각 레이어의 동작을 단위 테스트로 고정했음.
-(`cd server && npm test` — 96개)
+(`cd server && npm test` — 109개)
 
 설계 근거·대안 비교·측정값은 [RELIABILITY.md](RELIABILITY.md)에 정리했음.
 
@@ -115,11 +115,13 @@ Degradation을 직접 구현했음. 병목은 추측하지 않고 부하를 걸�
 없는 동작인데(취소한 게 이미지면 DB의 바이트까지 지움), 처음엔 그 권한을
 닉네임으로 판단했음. 닉네임은 말풍선·접속자 목록·방 목록으로 전부 공개되고
 닉네임 등록은 언제든 다시 보낼 수 있으니, 남의 이름을 그대로 적어 보내면 남의
-방을 지우고 남이 올린 사진을 모두에게서 없앨 수 있었음. 그래서 브라우저가 보관하는
-비밀값(clientKey)을 서버가 HMAC한 값을 신원으로 쓰고, 공개되는 건 그 HMAC 결과뿐임.
-화면은 그 값으로 "내 것"을 판단하고 서버는 같은 값으로 권한을 확인함 — 남의 것을
-봐도 흉내낼 수 없음. 로그인이 아니라 "이 탭" 수준의 신원이지만, 이름을 적어
-보내는 것과는 다름.
+방을 지우고 남이 올린 사진을 모두에게서 없앨 수 있었음. 그래서 보이는 이름과 권한의
+근거를 나눴고, 지금은 그 근거가 계정임. 대화에 보이는 건 display_name이고 취소·삭제
+권한은 계정의 user id로만 판단함 — 앞의 것은 공개되지만 뒤의 것은 세션 쿠키
+(httpOnly)가 증명하므로 이름을 그대로 적어 보내도 흉내낼 수 없음. 소켓은 연결
+자체가 인증이라, 핸드셰이크의 세션 쿠키로 사용자를 확인하고 실패하면 연결을 거절함.
+질문·문서·이미지 API도 전부 이 세션 뒤에 있음(`/api/metrics`만 예외 — 담기는 게
+집계 수치뿐이고, 로그인이 안 되는 장애를 진단할 자리라 열어둠).
 
 문서 Q&A와 같은 서버·같은 포트(4000)를 씀. 나누지 않은 이유는 전송 방식이 다를
 뿐 운영해야 할 프로세스를 늘릴 이유는 없기 때문임. 합치고 나니 오히려 중복이
@@ -256,9 +258,17 @@ server/
   breaker.ts          회로 차단기 — 임베딩용·생성용 두 개
   admin.ts            장애 주입 엔드포인트 보호 (토큰 / 루프백)
   faults.ts           런타임 장애 주입 스위치 (데모용)
+  rag/
+    types.ts          코어가 주고받는 값과 포트 (express·pg·genai를 import하지 않음)
+    engine.ts         질문 → 이벤트 흐름. 검색·거절·degrade 정책이 전부 여기
+  adapters/
+    embedder.ts       Embedder 포트 = Gemini 임베딩 + 회로
+    store.ts          VectorStore 포트 = pgvector 코사인 검색
+    generator.ts      AnswerGenerator 포트 = Gemini 생성 + 회로
+    logger.ts         QueryLogger 포트 = query_logs 적재
   routes/
     documents.ts      업로드, 목록, 원문 열람(GET), 수정(PUT), 삭제
-    chat.ts           검색 → 거절 게이트 → 회로 확인 → SSE 스트리밍 → 로깅
+    chat.ts           코어를 HTTP/SSE에 연결 (전송과 과부하 제어만 남김)
     images.ts         채팅 이미지 업로드(POST) / 조회(GET, 불변 캐시)
   realtime/
     types.ts          소켓 이벤트 계약 (web와 짝)
@@ -269,9 +279,9 @@ server/
   scripts/            부하 테스트, 캐시 벤치, 방어 레이어 시연
   schema.sql
   tsconfig.json       빌드 없음 — Node가 타입을 벗겨 실행, tsc는 검사만
-  *.test.ts           단위 테스트 96개
-                      (청킹·token bucket·rate limit·breaker·admission·rooms
-                       ·imagetype·소켓 페이로드·클라이언트 IP·오리진 판정
+  *.test.ts           단위 테스트 109개
+                      (RAG 코어·청킹·token bucket·rate limit·breaker·admission
+                       ·rooms·imagetype·소켓 페이로드·클라이언트 IP·오리진 판정
                        ·소켓 도배 제한)
 web/
   src/
@@ -311,9 +321,10 @@ docker-compose.yml    pgvector 포함 Postgres
   Postgres에 남겨 durability 확보 → ③ Socket.IO Redis 어댑터로 pub/sub을 붙이고
   presence를 Redis로 옮겨, 다른 서버에 붙은 사용자에게도 메시지가 가게 하는
   순서를 생각하고 있음. 임베딩 캐시가 인메모리인 것과 같은 성격의 한계임.
-- 채팅에 로그인이 없음. 닉네임은 아무나 같은 값을 쓸 수 있고(표시용일 뿐),
-  권한은 브라우저에 보관한 키에서 나오므로 그 탭을 벗어나면 이어지지 않음.
-  다른 기기에서 같은 사람임을 증명하려면 계정이 필요함.
+- 로그인은 있지만 문서 단위 접근 제어가 없음. 세션은 "들어온 사람인가"까지만
+  답하고, `documents`에 소유자·그룹 컬럼이 없어서 로그인한 사람은 모두 같은
+  코퍼스를 봄. 없는 필터를 있는 척하지 않으려고 저장소 어댑터가 범위 검색 자체를
+  막아뒀지만, 그 컬럼이 생기기 전까지는 인가가 없는 상태임.
 - 서버와 프런트가 이벤트 계약 타입을 각자 복사해 갖고 있음. 지금 규모에선
   워크스페이스를 도입하는 비용이 더 커서 미뤘고, 커지면 공용 패키지로 뺄 계획임.
 - 검증이 아직 단위 테스트 수준임. 소켓 오리진·CSRF처럼 서버를 실제로 띄워야

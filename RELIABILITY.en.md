@@ -302,7 +302,7 @@ down even during an outage.
 
 ## 5. Graceful Degradation — don't send people away empty-handed
 
-File: server/routes/chat.ts (degrade)
+File: server/rag/engine.ts (degrade)
 
 What I was worried about (P)
 If the LLM dies and all the user gets is "error," the user gets nothing. For a
@@ -336,7 +336,7 @@ A: Cache the question embedding. In-memory for now (node-cache); when there's mo
 R: Measured against real Gemini — cache miss 1197 ms, cache hit 0.05 ms. Removes
    about 1.2 seconds per repeated question.
 
-### Moving log writes off the response path (server/routes/chat.ts)
+### Moving log writes off the response path (server/adapters/logger.ts)
 P: Every question writes an observability log to the DB, and waiting for that write
    was delaying the user's response.
 A: Logs are written in the background after the user has received the whole answer
@@ -368,7 +368,7 @@ blocked as flooding) all at once. (Prometheus + Grafana in production.)
 ```bash
 cd server                     # there's no package.json at the root. Everything below is relative to server/
 
-# unit tests for the defense layers (96)
+# unit tests for the defense layers (109)
 npm test
 
 # cache effect (real Gemini)
@@ -397,7 +397,7 @@ k6 or Artillery. The server has no build step. Node strips the types and runs
 `node index.ts` directly, and `tsc` is only a checker (`npm run typecheck`). The
 paths in the commands above are the source paths.
 
-### What I pinned with tests rather than measurements (96)
+### What I pinned with tests rather than measurements (109)
 
 A measurement only shows "this is the number right now"; it doesn't guarantee the
 behavior is still the same in the next commit. So when each layer should fire is
@@ -665,4 +665,4 @@ Two things worth flagging:
 | Graceful degradation on failure | Sources returned even with the LLM dead, error rate 0 |
 | Question embedding cache | Repeated questions 1197ms → 0.05ms |
 | Log writes moved to the background | p99 2794 → 1606ms (-42%) |
-| Injecting the clock in tests | Deterministic without waiting; layer behavior pinned by 96 tests |
+| Injecting the clock in tests | Deterministic without waiting; layer behavior pinned by 109 tests |

@@ -310,19 +310,26 @@ XFFを変えながら撃ってみて、他人のニックネームで他人の�
 そのまま書いて送れば、他人のルームを消し、他人がアップロードした写真を
 **DBのバイト列まで全員から**消すことができた。取り返しがつかない。
 
-アカウントを付けるのが正解だが、その手前でも「表示される名前」と「権限の根拠」を
-同じ値で使わないことはできた。
+まず「表示される名前」と「権限の根拠」を同じ値で使わないように分け(ブラウザが
+保管する秘密値をHMACしたauthorId)、その後アカウントを付けてその根拠をアカウントへ
+引き上げた。今はこの形である。
 
 ```
-clientKey   ブラウザが作って保管する任意の値。サーバーにしか行かず、他人には出ない
-authorId    clientKeyをサーバーの秘密鍵でHMACした値。公開しても逆算できない
+display_name  会話に見える名前。公開される値で、誰でも同じ値を使える
+user id       アカウントの身元(uuid)。取り消し・削除の権限はこの値だけで判断する
+セッショントークン  httpOnlyクッキーでのみ流れる。JSからは読めず、ログアウトでサーバーが即座に捨てる
 ```
 
-画面はauthorIdで「自分のもの」を判断し(取り消しボタン)、サーバーは同じ値で権限を
-確認する。他人のauthorIdを見ても、自分のclientKeyからその値は出てこないので真似できない。
-`socket.id`で紐づける方法は使えない — 再接続のたびに変わるので、リロード1回で自分の
-ルームを消せなくなる。アカウントではなく「このタブ」レベルの身元だという限界は
-そのままだが、**公開される値で認可しない**という原則は守られる。
+画面はuser idで「自分のもの」を判断し(取り消しボタン)、サーバーは同じ値で権限を
+確認する。`socket.id`で紐づける方法は使えない — 再接続のたびに変わるので、リロード
+1回で自分のルームを消せなくなる。ソケットは接続自体が認証で、ハンドシェイクの
+セッションクッキーでユーザーを確認し、失敗すれば接続を拒否する。身元が「このタブ」から
+アカウントへ上がったことで別の端末でも同一人物になり、**公開される値で認可しない**
+という原則はそのままである。
+
+質問・文書・画像のAPIも同じセッションの後ろへ入れた。`/api/metrics`だけは開けてある。
+入るのが集計値だけであり、「ログインできない」という障害を診断する場所がログインの
+後ろにあってはならないからだ。
 
 ---
 
@@ -351,7 +358,7 @@ authorId    clientKeyをサーバーの秘密鍵でHMACした値。公開して�
 
 テスト
 
-単体テスト96個通過(`npm test`)。外部依存なしで回る純粋ロジックに集中した。
+単体テスト109個通過(`npm test`)。外部依存なしで回る純粋ロジックに集中した。
 
 | 対象 | 件数 | 検証内容 |
 |---|---|---|
@@ -383,24 +390,23 @@ Token Bucketは`take(key, now)`のように時刻を引数で受け取る形に�
 
 ## コアロジックの抜粋
 
-拒否ゲート — このプロジェクトのアイデンティティ (server/routes/chat.ts)
+拒否ゲート — このプロジェクトのアイデンティティ (server/rag/engine.ts)
 
 ```ts
-const topSimilarity = rows[0]?.similarity ?? 0;
+const topSimilarity = chunks[0]?.similarity ?? 0;
 
-if (rows.length === 0 || topSimilarity < THRESHOLD) {
-  send({
-    type: "refusal",
-    // 「アップロードされたドキュメントから関連する内容が見つかりませんでした。
-    //  質問を変えるか、関連ドキュメントをアップロードしてください」
-    message: "업로드된 문서에서 관련 내용을 찾지 못했어요. 질문을 바꿔보시거나 관련 문서를 올려주세요.",
-  });
-  res.end();          // ここで終わり — AIを呼びもしない
-  return;
+if (chunks.length === 0 || topSimilarity < policy.threshold) {
+  yield { type: "refusal", message: messages.refusal };
+  log({ question, refused: true, topSimilarity, /* ... */ });
+  return;             // ここで終わり — 生成器を呼びもしない
 }
 ```
 
-ベクトル検索 — pgvectorのコサイン距離 (server/routes/chat.ts)
+`res` に書くのではなくイベントを yield するのが要点。この関数が HTTP を知らない
+おかげで、同じロジックが Teams ボットや CLI でもそのまま動く。そして何より、
+DB も外部 API もなしにテストできる (server/rag/engine.test.ts)。
+
+ベクトル検索 — pgvectorのコサイン距離 (server/adapters/store.ts)
 
 ```sql
 select c.content, d.filename,
@@ -426,10 +432,10 @@ for (let start = 0; start < words.length; start += step) {
 
 ```ts
 // クライアント → サーバー (サーバーが聞くイベント)
+// hello(ニックネーム登録)がない理由: 身元がソケットイベントではなくログイン
+// セッションから来る。接続自体が認証だ — ハンドシェイクのセッションクッキーで
+// ユーザーを確認し、失敗すれば接続が拒否される(上の4番の身元)。
 export interface ClientToServer {
-  // ニックネーム登録 → ロビーへ。clientKeyはブラウザが生成して保管する秘密値 —
-  // 再接続しても同じ値だからこそ、自分が作った部屋を消し続けられる(上の4番の身元)。
-  hello: (payload: { nickname: string; clientKey?: string }) => void;
   join: (payload: { room: string }) => void;      // 入室 (なければ作成) / 部屋の移動
   leave: () => void;                              // 部屋だけ出てロビーへ
   deleteRoom: (payload: { room: string }) => void; // 部屋の削除 (部屋主のみ)
@@ -438,11 +444,9 @@ export interface ClientToServer {
   deleteMessage: (payload: { messageId: string }) => void; // 自分が送ったものの取り消し
   typing: () => void;
 }
-// helloとjoinを分けた理由: ニックネームはロビーで一度決め、部屋はその後何度でも
-// 移動する。1つのイベントにまとめると部屋を移るたびにニックネームを載せ直すことになり、
-// その値が毎回違ってもサーバーには知りようがない。
-// (ServerToClientは me / rooms / history / message / messageDeleted / presence /
-//  system / typing / roomClosed / chatError)
+// (ServerToClientは rooms / history / message / messageDeleted / presence /
+//  system / typing / roomClosed / chatError — meがない理由は、自分の身元を
+//  ログイン応答(/api/auth/me)が教えてくれるからだ)
 
 // この契約をジェネリックで渡すと、emit/on の名前とpayloadが型検査を受ける
 const io: Server<ClientToServer, ServerToClient, ..., SocketData> =
@@ -463,9 +467,11 @@ const io: Server<ClientToServer, ServerToClient, ..., SocketData> =
 - 拒否のしきい値をログを見ながら手動で調整している。正解付きの質問セットで
   自動測定するのが次の目標だ。今の状態では、しきい値を変えたときに良くなったのか
   悪くなったのかを言う根拠が、ログを目で見ることしかない。
-- チャットにアカウントがない。ニックネームは表示用で、権限はブラウザに保管した鍵から
-  出るため(上の4番)、そのタブを離れると同一人物であることを証明し続けられない。
-  別の端末から自分のルームを消すにはアカウントが必要だ。
+- ログインはあるが、文書単位のアクセス制御がない。セッションが答えるのは「入ってきた
+  人か」までで、`documents`に所有者・グループの列がないため、ログインした人は全員
+  同じコーパスを見る。ない絞り込みをあるふりにしないため、ストア側のアダプタが範囲
+  検索そのものを塞いであるが(だから認可を付けた瞬間にコンパイルが壊れる)、その列が
+  できるまでは認可がない状態である。
 - リアルタイムチャットの部屋の状態と直近の履歴がサーバーのメモリ上にある。
   サーバーが落ちれば消え、サーバーを複数台に増やせば部屋が分裂する。永続化と
   Redisアダプターが次の段階だ。
@@ -494,7 +500,7 @@ cd web && npm install && npm run dev   # http://localhost:5173
 テストとダッシュボードのデモ:
 
 ```bash
-cd server && npm test                # 単体テスト96件
+cd server && npm test                # 単体テスト109件
 cd server && npm run typecheck       # tscは検査のみ (ビルド成果物なし)
 cd server && npm run start:demo      # mock LLMモード — ダッシュボードで障害注入をデモ
 ```

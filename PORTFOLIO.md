@@ -302,19 +302,26 @@ async function withRetry<T>(fn: () => Promise<T>): Promise<T> {
 닉네임 등록은 언제든 다시 보낼 수 있음. 즉 남의 이름을 그대로 적어 보내면 남의 방을
 지우고 남이 올린 사진을 **DB 바이트까지 모두에게서** 없앨 수 있었음. 되돌릴 수 없음.
 
-계정을 붙이는 게 정답이지만, 그전에도 "보이는 이름"과 "권한의 근거"를 같은 값으로
-쓰지 않을 수는 있었음.
+먼저 "보이는 이름"과 "권한의 근거"를 같은 값으로 쓰지 않게 분리했고(브라우저가
+보관하는 비밀값을 HMAC한 authorId), 그다음 계정을 붙이면서 그 근거를 계정으로
+올렸음. 지금은 이 모양임.
 
 ```
-clientKey   브라우저가 만들어 보관하는 임의의 값. 서버로만 가고 남에게 안 나감
-authorId    clientKey를 서버 비밀키로 HMAC한 값. 공개해도 되돌릴 수 없음
+display_name  대화에 보이는 이름. 공개되는 값이고 아무나 같은 값을 쓸 수 있음
+user id       계정의 신원(uuid). 취소·삭제 권한은 이 값으로만 판단
+세션 토큰      httpOnly 쿠키로만 오감. JS가 못 읽고, 로그아웃하면 서버가 즉시 버림
 ```
 
-화면은 authorId로 "내 것"을 판단하고(취소 버튼), 서버는 같은 값으로 권한을 확인함.
-남의 authorId를 봐도 자기 clientKey에서 그 값이 나오지 않으므로 흉내낼 수 없음.
+화면은 user id로 "내 것"을 판단하고(취소 버튼), 서버는 같은 값으로 권한을 확인함.
 `socket.id`로 묶는 방법은 안 됨 — 재연결마다 바뀌어서 새로고침 한 번에 자기 방을
-못 지우게 됨. 계정이 아니라 "이 탭" 수준의 신원이라는 한계는 그대로지만,
-**공개되는 값으로 인가하지 않는다**는 원칙은 지켜짐.
+못 지우게 됨. 소켓은 연결 자체가 인증이라 핸드셰이크의 세션 쿠키로 사용자를
+확인하고, 실패하면 연결을 거절함. 신원이 "이 탭"에서 계정으로 올라가면서
+다른 기기에서도 같은 사람이 됐고, **공개되는 값으로 인가하지 않는다**는 원칙은
+그대로임.
+
+질문·문서·이미지 API도 같은 세션 뒤로 넣었음. `/api/metrics`만 열어뒀는데,
+담기는 게 집계 수치뿐이고 "로그인이 안 된다"는 장애를 진단할 자리가 로그인 뒤에
+있으면 안 되기 때문임.
 
 ---
 
@@ -343,7 +350,7 @@ authorId    clientKey를 서버 비밀키로 HMAC한 값. 공개해도 되돌릴
 
 테스트
 
-단위 테스트 96개 통과 (`npm test`). 외부 의존성 없이 도는 순수 로직에 집중했음.
+단위 테스트 109개 통과 (`npm test`). 외부 의존성 없이 도는 순수 로직에 집중했음.
 
 | 대상 | 개수 | 검증 내용 |
 |---|---|---|
@@ -374,22 +381,23 @@ Socket.IO가 리스너를 try/catch 없이 부르는 탓에 프로세스가 통�
 
 ## 핵심 로직 발췌
 
-거절 게이트 — 이 프로젝트의 정체성 (server/routes/chat.ts)
+거절 게이트 — 이 프로젝트의 정체성 (server/rag/engine.ts)
 
 ```ts
-const topSimilarity = rows[0]?.similarity ?? 0;
+const topSimilarity = chunks[0]?.similarity ?? 0;
 
-if (rows.length === 0 || topSimilarity < THRESHOLD) {
-  send({
-    type: "refusal",
-    message: "업로드된 문서에서 관련 내용을 찾지 못했어요. 질문을 바꿔보시거나 관련 문서를 올려주세요.",
-  });
-  res.end();          // 여기서 끝 — AI를 부르지도 않는다
-  return;
+if (chunks.length === 0 || topSimilarity < policy.threshold) {
+  yield { type: "refusal", message: messages.refusal };
+  log({ question, refused: true, topSimilarity, /* ... */ });
+  return;             // 여기서 끝 — 생성기를 부르지도 않는다
 }
 ```
 
-벡터 검색 — pgvector 코사인 거리 (server/routes/chat.ts)
+res가 아니라 이벤트를 yield하는 게 핵심임. 이 함수가 HTTP를 모르기 때문에
+같은 로직이 Teams 봇이나 CLI에서도 그대로 돌고, 무엇보다 DB·외부 API 없이
+테스트할 수 있음 (server/rag/engine.test.ts).
+
+벡터 검색 — pgvector 코사인 거리 (server/adapters/store.ts)
 
 ```sql
 select c.content, d.filename,
@@ -414,10 +422,10 @@ for (let start = 0; start < words.length; start += step) {
 
 ```ts
 // 클라이언트 → 서버 (서버가 듣는 이벤트)
+// hello(닉네임 등록)가 없는 이유: 신원이 소켓 이벤트가 아니라 로그인 세션에서
+// 온다. 연결 자체가 인증이다 — 핸드셰이크의 세션 쿠키로 사용자를 확인하고,
+// 실패하면 연결이 거절된다(위 4번의 신원).
 export interface ClientToServer {
-  // 닉네임 등록 → 로비 진입. clientKey는 브라우저가 만들어 보관하는 비밀값 —
-  // 재연결해도 같은 값이라야 자기가 만든 방을 계속 지울 수 있다(위 4번의 신원).
-  hello: (payload: { nickname: string; clientKey?: string }) => void;
   join: (payload: { room: string }) => void;      // 방 입장 (없으면 생성) / 방 이동
   leave: () => void;                              // 방만 나가고 로비로
   deleteRoom: (payload: { room: string }) => void; // 방 삭제 (방장만)
@@ -426,11 +434,9 @@ export interface ClientToServer {
   deleteMessage: (payload: { messageId: string }) => void; // 내가 보낸 것 취소
   typing: () => void;
 }
-// hello와 join을 나눈 이유: 닉네임은 로비에서 한 번 정하고, 방은 그 뒤로 몇 번이든
-// 옮겨 다닌다. 한 이벤트에 묶으면 방을 옮길 때마다 닉네임을 다시 실어 보내게 되고,
-// 그 값이 매번 달라도 서버가 알 길이 없다.
-// (ServerToClient는 me / rooms / history / message / messageDeleted / presence /
-//  system / typing / roomClosed / chatError)
+// (ServerToClient는 rooms / history / message / messageDeleted / presence /
+//  system / typing / roomClosed / chatError — me가 없는 이유는 내 신원을
+//  로그인 응답(/api/auth/me)이 알려주기 때문이다)
 
 // 이 계약을 제네릭으로 넘기면 emit/on의 이름과 payload가 타입 검사를 받는다
 const io: Server<ClientToServer, ServerToClient, ..., SocketData> =
@@ -451,9 +457,11 @@ const io: Server<ClientToServer, ServerToClient, ..., SocketData> =
 - 거절 임계값을 로그를 보며 수동으로 맞추고 있음. 정답이 있는 질문 세트로
   자동 측정하는 것이 다음 목표임. 지금 상태로는 임계값을 바꿨을 때 좋아졌는지
   나빠졌는지를 말할 근거가 로그를 눈으로 보는 것뿐임.
-- 채팅에 계정이 없음. 닉네임은 표시용이고 권한은 브라우저에 보관한 키에서
-  나오므로(위 4번), 그 탭을 벗어나면 같은 사람임을 이어서 증명할 수 없음.
-  다른 기기에서 자기 방을 지우려면 계정이 필요함.
+- 로그인은 있지만 문서 단위 접근 제어가 없음. 세션은 "들어온 사람인가"까지만
+  답하고, `documents`에 소유자·그룹 컬럼이 없어서 로그인한 사람은 모두 같은
+  코퍼스를 봄. 없는 필터를 있는 척하지 않으려고 저장소 어댑터가 범위 검색 자체를
+  막아뒀지만(그래서 인가를 붙이는 순간 컴파일이 깨짐), 그 컬럼이 생기기 전까지는
+  인가가 없는 상태임.
 - 실시간 채팅의 방 상태와 최근 기록이 서버 메모리에 있음. 서버가 죽으면 날아가고,
   서버를 여러 대로 늘리면 방이 갈라짐. 영구 저장과 Redis 어댑터가 다음 단계임.
   (문서 Q&A 쪽 인메모리 캐시가 서버 한 대를 전제하는 것과 같은 한계임.)
@@ -481,7 +489,7 @@ cd web && npm install && npm run dev   # http://localhost:5173
 테스트와 대시보드 데모:
 
 ```bash
-cd server && npm test                # 단위 테스트 96개
+cd server && npm test                # 단위 테스트 109개
 cd server && npm run typecheck       # tsc는 검사만 (빌드 산출물 없음)
 cd server && npm run start:demo      # mock LLM 모드 — 대시보드에서 장애 주입 시연
 ```

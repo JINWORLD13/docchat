@@ -109,7 +109,7 @@ wait deadline), Bulkhead (three connection pools — readPool, writePool, mediaP
 so image fetches don't starve question answering), Circuit Breaker (one for
 embedding, one for generation), and Graceful Degradation myself. I didn't guess at
 the bottleneck; I put load on it and measured (it was the DB pool, not the LLM), and
-pinned each layer's behavior with unit tests. (`cd server && npm test` — 96 of them)
+pinned each layer's behavior with unit tests. (`cd server && npm test` — 109 of them)
 
 The reasoning, the alternatives I compared, and the numbers are in
 [RELIABILITY.en.md](RELIABILITY.en.md).
@@ -133,12 +133,16 @@ out of the DB too), and at first I decided that permission by nickname. Nickname
 are fully public — in the bubbles, the connected-user list, the room list — and
 nickname registration can be re-sent at any time, so writing down someone else's
 name and sending it let you delete their room and wipe their uploaded photo from
-everyone. So now the identity is a secret the browser keeps (clientKey) run through
-an HMAC on the server, and the only thing made public is that HMAC output. The UI
-uses that value to decide what's "mine" and the server checks permission against
-the same value — seeing someone else's doesn't let you imitate it. It's not a
-login; it's identity at the level of "this tab." But it's not the same as typing in
-a name.
+everyone. So I split the visible name from what
+authorization rests on, and that basis is now the account. What shows in the
+conversation is `display_name`; unsend and delete permission is decided only by the
+account's user id. The first is public, but the second is proven by an httpOnly
+session cookie, so writing down someone else's name gets you nowhere. For the
+socket, connecting *is* the authentication: the handshake's session cookie
+identifies the user, and the connection is refused if it fails. The question,
+document, and image APIs all sit behind that same session too — `/api/metrics` is
+the one exception, since it carries only aggregate counters and is exactly the
+place you'd diagnose a "nobody can log in" outage from.
 
 It uses the same server and the same port (4000) as the document Q&A. I didn't
 split them because a different transport isn't a reason to run one more process.
@@ -294,9 +298,17 @@ server/
   breaker.ts          circuit breakers — one for embedding, one for generation
   admin.ts            protection for the fault-injection endpoint (token / loopback)
   faults.ts           runtime fault-injection switches (for the demo)
+  rag/
+    types.ts          core values and ports (imports no express / pg / genai)
+    engine.ts         question → event stream. search, refusal, degrade policy
+  adapters/
+    embedder.ts       Embedder port = Gemini embedding + circuit
+    store.ts          VectorStore port = pgvector cosine search
+    generator.ts      AnswerGenerator port = Gemini generation + circuit
+    logger.ts         QueryLogger port = query_logs writes
   routes/
     documents.ts      upload, list, read original (GET), edit (PUT), delete
-    chat.ts           search → refusal gate → circuit check → SSE stream → logging
+    chat.ts           wires the core to HTTP/SSE (transport + admission only)
     images.ts         chat image upload (POST) / fetch (GET, immutable cache)
   realtime/
     types.ts          socket event contract (paired with web)
@@ -307,7 +319,7 @@ server/
   scripts/            load test, cache bench, defense layer demo
   schema.sql
   tsconfig.json       no build — Node strips types and runs, tsc only checks
-  *.test.ts           96 unit tests
+  *.test.ts           109 unit tests
                       (chunking · token bucket · rate limit · breaker · admission
                        · rooms · imagetype · socket payloads · client IP · origin
                        decision · socket flood limit)
@@ -352,9 +364,11 @@ chunks (they overlap), so it's kept separately in `documents.content`.
   Socket.IO Redis adapter for pub/sub and move presence to Redis so messages reach
   users connected to a different server. It's the same kind of limit as the
   embedding cache being in-memory.
-- Chat has no login. Anyone can use the same nickname (it's display only), and
-  permission comes from a key kept in the browser, so it doesn't follow you outside
-  that tab. Proving you're the same person from another device needs an account.
+- There is login, but no per-document access control. The session only answers
+  "is this someone who got in"; `documents` has no owner or group column, so
+  everyone who logs in sees the same corpus. Rather than pretend a filter exists,
+  the store adapter refuses scoped search outright — but until that column exists,
+  authorization is simply absent.
 - The server and the frontend each keep their own copy of the event contract types.
   At this size the cost of introducing a workspace is higher than the duplication,
   so I deferred it; if it grows I'll pull them into a shared package.

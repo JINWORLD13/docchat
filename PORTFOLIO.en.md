@@ -347,20 +347,27 @@ registration can be re-sent at any time. Writing down someone else's name and
 sending it let you delete their room and erase a photo they uploaded from everyone,
 **down to the bytes in the DB**. No way back.
 
-Adding accounts is the right answer, but even short of that I could stop using one
-value as both "the name shown" and "the basis for permission."
+First I stopped using one value as both "the name shown" and "the basis for
+permission" (an authorId: a secret the browser keeps, HMAC'd on the server). Then I
+added accounts and raised that basis up to the account. This is the shape now.
 
 ```
-clientKey   a random value the browser creates and keeps. Goes only to the server, never to others
-authorId    clientKey HMAC'd with the server's secret. Safe to publish; can't be reversed
+display_name  the name shown in conversation. Public, and anyone can use the same one
+user id       the account's identity (uuid). Unsend/delete permission is decided by this alone
+session token flows only in an httpOnly cookie. JS can't read it; logout drops it server-side at once
 ```
 
-The UI decides what's "mine" from authorId (the unsend button), and the server
-checks permission against the same value. Seeing someone else's authorId doesn't
-help, because it doesn't come out of your clientKey. Binding to `socket.id` doesn't
-work — it changes on every reconnect, so one page refresh and you can't delete your
-own room. It's still identity at the level of "this tab" rather than an account, but
-the principle holds: **don't authorize on a value that's published.**
+The UI decides what's "mine" from the user id (the unsend button), and the server
+checks permission against the same value. Binding to `socket.id` doesn't work — it
+changes on every reconnect, so one page refresh and you can't delete your own room.
+For the socket, connecting *is* the authentication: the handshake's session cookie
+identifies the user, and the connection is refused if it fails. Moving identity from
+"this tab" up to an account means you're the same person on another device too, and
+the principle is unchanged: **don't authorize on a value that's published.**
+
+The question, document, and image APIs went behind that same session. `/api/metrics`
+is left open — it carries only aggregate counters, and the place you'd diagnose a
+"nobody can log in" outage from must not itself sit behind login.
 
 ---
 
@@ -389,7 +396,7 @@ That gap is the evidence that the refusal gate actually works.
 
 Tests
 
-96 unit tests passing (`npm test`). Focused on pure logic that runs with no external
+109 unit tests passing (`npm test`). Focused on pure logic that runs with no external
 dependencies.
 
 | Target | Count | What it verifies |
@@ -423,24 +430,24 @@ boundary).
 
 ## Core logic excerpts
 
-The refusal gate — this project's identity (server/routes/chat.ts)
+The refusal gate — this project's identity (server/rag/engine.ts)
 
 ```ts
-const topSimilarity = rows[0]?.similarity ?? 0;
+const topSimilarity = chunks[0]?.similarity ?? 0;
 
-if (rows.length === 0 || topSimilarity < THRESHOLD) {
-  send({
-    type: "refusal",
-    // "Couldn't find anything relevant in the uploaded documents.
-    //  Try rephrasing, or upload a related document."
-    message: "업로드된 문서에서 관련 내용을 찾지 못했어요. 질문을 바꿔보시거나 관련 문서를 올려주세요.",
-  });
-  res.end();          // it ends here — the AI is never called
-  return;
+if (chunks.length === 0 || topSimilarity < policy.threshold) {
+  yield { type: "refusal", message: messages.refusal };
+  log({ question, refused: true, topSimilarity, /* ... */ });
+  return;             // it ends here — the generator is never called
 }
 ```
 
-Vector search — pgvector cosine distance (server/routes/chat.ts)
+Yielding an event instead of writing to `res` is the point. Because this function
+knows nothing about HTTP, the same logic runs in a Teams bot or a CLI — and, more
+importantly, it can be tested without a database or an external API
+(server/rag/engine.test.ts).
+
+Vector search — pgvector cosine distance (server/adapters/store.ts)
 
 ```sql
 select c.content, d.filename,
@@ -466,11 +473,11 @@ The socket event contract — the device that catches typos at compile time
 
 ```ts
 // client → server (events the server listens for)
+// Why there's no hello (nickname registration): identity comes from the login
+// session, not from a socket event. Connecting is the authentication — the
+// handshake's session cookie identifies the user, and the connection is refused
+// if it fails (the identity from problem 4 above).
 export interface ClientToServer {
-  // register nickname → enter lobby. clientKey is a secret the browser generates
-  // and keeps — it survives reconnects, which is what lets you keep deleting your
-  // own room (the identity from problem 4 above).
-  hello: (payload: { nickname: string; clientKey?: string }) => void;
   join: (payload: { room: string }) => void;      // join a room (created if absent) / switch rooms
   leave: () => void;                              // leave the room only, back to the lobby
   deleteRoom: (payload: { room: string }) => void; // delete a room (owner only)
@@ -479,12 +486,9 @@ export interface ClientToServer {
   deleteMessage: (payload: { messageId: string }) => void; // retract something I sent
   typing: () => void;
 }
-// Why hello and join are separate: the nickname is set once in the lobby, and after that
-// you move between rooms as many times as you like. Bundled into one event, you'd resend
-// the nickname on every room change, and the server would have no way to know if that
-// value changed each time.
-// (ServerToClient is me / rooms / history / message / messageDeleted / presence /
-//  system / typing / roomClosed / chatError)
+// (ServerToClient is rooms / history / message / messageDeleted / presence /
+//  system / typing / roomClosed / chatError — there's no me because the login
+//  response (/api/auth/me) is what tells you your own identity)
 
 // Passing this contract as a generic gets emit/on names and payloads type-checked
 const io: Server<ClientToServer, ServerToClient, ..., SocketData> =
@@ -506,10 +510,11 @@ failure handling are written up separately in [RELIABILITY.en.md](RELIABILITY.en
   automatically against a question set with known answers is the next goal. As
   things stand, the only basis I have for saying a threshold change made things
   better or worse is reading logs with my own eyes.
-- Chat has no accounts. The nickname is for display and permission comes from a key
-  kept in the browser (see 4 above), so once you leave that tab you can't go on
-  proving you're the same person. Deleting your own room from another device needs
-  an account.
+- There is login, but no per-document access control. The session only answers "is
+  this someone who got in"; `documents` has no owner or group column, so everyone
+  who logs in sees the same corpus. Rather than pretend a filter exists, the store
+  adapter refuses scoped search outright (so adding authorization breaks the build
+  on purpose) — but until that column exists, authorization is simply absent.
 - Room state and recent history for the real-time chat live in server memory. They
   vanish if the server dies, and rooms split apart if I scale to several servers.
   Persistence and a Redis adapter are the next step. (The same limit as the
@@ -539,7 +544,7 @@ cd web && npm install && npm run dev   # http://localhost:5173
 Tests and the dashboard demo:
 
 ```bash
-cd server && npm test                # 96 unit tests
+cd server && npm test                # 109 unit tests
 cd server && npm run typecheck       # tsc only checks (no build output)
 cd server && npm run start:demo      # mock LLM mode — fault injection demo on the dashboard
 ```
