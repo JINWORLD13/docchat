@@ -2,11 +2,18 @@
 //   MODE=burst   COUNT=15 node scripts/demo-defense.ts   → Rate Limiter (한 IP 폭주 차단)
 //   MODE=breaker COUNT=9  node scripts/demo-defense.ts   → Circuit Breaker + Degradation
 import type { MetricsResponse } from "../types.ts";
+import { guestCookie } from "./session.ts";
 
 const COUNT = Number(process.env.COUNT || 15);
 const MODE = process.env.MODE || "burst";
-const CHAT = "http://localhost:4000/api/chat";
-const METRICS = "http://localhost:4000/api/metrics";
+const BASE = process.env.DEMO_URL || "http://localhost:4000";
+const CHAT = `${BASE}/api/chat`;
+const METRICS = `${BASE}/api/metrics`;
+
+// 질문 경로가 로그인을 요구하므로 게스트로 한 번 입장해 쿠키를 들고 다닌다.
+// 없으면 전부 401이 되어 "Rate Limiter가 막았다"와 구분이 안 된다 —
+// 이 스크립트는 어느 레이어가 막았는지를 보여주는 게 목적이라 치명적이다.
+const cookie = await guestCookie(BASE, "demo");
 
 interface Attempt {
   status: number;
@@ -18,7 +25,7 @@ async function once(): Promise<Attempt> {
   const t = performance.now();
   const res = await fetch(CHAT, {
     method: "POST",
-    headers: { "Content-Type": "application/json" },
+    headers: { "Content-Type": "application/json", cookie },
     body: JSON.stringify({ question: "환불은 며칠 걸려?" }),
   });
   const text = await res.text().catch(() => "");

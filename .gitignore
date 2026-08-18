@@ -3,8 +3,12 @@ dist/
 .env
 .DS_Store
 
-# 개인 학습 노트 — 저장소에 올리지 않는다
+# 개인 학습 노트 — 저장소에 올리지 않는다.
+# 여기 없으면 `git add -A` 한 번에 그대로 공개된다. 추적만 안 되고 있던
+# LEARN.md·STUDY2.md도 같이 못박아 둔다 (공개 문서에서 참조해서도 안 됨).
 STUDY.md
+STUDY2.md
+LEARN.md
 
 # Claude Code 로컬 설정 (개인 환경마다 다름)
 .claude/

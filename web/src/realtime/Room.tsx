@@ -9,6 +9,7 @@ import {
 } from "react";
 import { socket } from "./socket";
 import { MAX_IMAGE_BYTES, uploadChatImage } from "../api";
+import { displaySize, readDimensions } from "../images";
 import type { ChatMessage } from "./types";
 
 interface Props {
@@ -41,17 +42,6 @@ function newId(): string {
   }
   localSeq += 1;
   return `sys-${Date.now()}-${localSeq}`;
-}
-
-// 이미지의 원본 크기를 미리 재둔다.
-// 이 값이 있어야 <img>가 뜨기 전에 자리를 잡아, 사진이 로드될 때 위의 대화가
-// 아래로 밀리지 않는다. 여기서 실패하면 브라우저가 못 읽는 파일이라는 뜻이라
-// 업로드까지 가지 않고 바로 알려준다.
-async function readDimensions(file: File): Promise<{ width: number; height: number }> {
-  const bitmap = await createImageBitmap(file);
-  const size = { width: bitmap.width, height: bitmap.height };
-  bitmap.close();
-  return size;
 }
 
 // 대화창.
@@ -407,37 +397,8 @@ export default function Room({
   );
 }
 
-// 말풍선에 넣을 이미지의 표시 크기.
-//
-// CSS만으로 width:100% / height:auto 를 주면 안 된다. 부모가 내용에 맞춰
-// 줄어드는(shrink-to-fit) 상자라 100%의 기준이 결국 이미지의 원본 픽셀 크기가
-// 되고, 넘겨준 width/height는 무시된다. 그러면 작은 이미지는 아주 작게 나오고,
-// 무엇보다 로드되기 전에는 상자 크기를 모르니 자리를 못 잡아 대화가 밀린다.
-// 그래서 표시 크기를 여기서 직접 계산해 상자에 박아둔다.
-const MAX_W = 320;
-const MAX_H = 360;
-const MIN_SIDE = 48; // 아주 작은 이미지도 눌러볼 수 있을 만큼은 보이게
-
-function displaySize(width: number, height: number): { width: number; height: number } {
-  const safeW = Math.max(1, width);
-  const safeH = Math.max(1, height);
-  const base = Math.min(MAX_W / safeW, MAX_H / safeH, 1); // 원본보다 키우지는 않는다
-
-  // 하한(MIN_SIDE)은 가로·세로에 따로 걸면 안 된다. 그러면 비율이 깨진 상자가
-  // 나오고, 이미지는 object-fit: cover라 그만큼 잘려나간다 — 1000×10 배너가
-  // 320×48 상자에 담겨 원본의 일부만 확대돼 보이는 식이다.
-  // 그래서 하한도 비율을 유지한 채(양쪽 같은 배율로) 키우고,
-  // 그러다 상한을 넘게 되면 키우기를 포기한다. 상자 모양이 원본과 다른 것보다
-  // 작게 보이는 쪽이 낫다.
-  const needed = Math.max(MIN_SIDE / (safeW * base), MIN_SIDE / (safeH * base), 1);
-  const room = Math.max(Math.min(MAX_W / (safeW * base), MAX_H / (safeH * base)), 1);
-  const scale = base * Math.min(needed, room);
-
-  return {
-    width: Math.round(safeW * scale),
-    height: Math.round(safeH * scale),
-  };
-}
+// 말풍선에 넣을 이미지의 표시 크기 계산(displaySize)은 ../images.ts에 있다 —
+// 문서 Q&A의 첨부 이미지와 같은 계산을 쓴다.
 
 function Bubble({
   msg,
@@ -453,45 +414,56 @@ function Bubble({
     minute: "2-digit",
   });
 
+  const body =
+    msg.kind === "image" ? (
+      // 크기를 미리 박아두면 이미지가 도착하기 전에도 자리가 잡힌다
+      <a
+        className="bubble-image"
+        href={msg.url}
+        target="_blank"
+        rel="noreferrer"
+        style={displaySize(msg.width, msg.height)}
+      >
+        <img src={msg.url} loading="lazy" alt={`${msg.nickname} 님이 보낸 이미지`} />
+      </a>
+    ) : (
+      <div className="bubble">
+        <span className="bubble-text">{msg.text}</span>
+      </div>
+    );
+
   return (
     <div className={"bubble-row" + (mine ? " mine" : "")}>
-      {!mine && <div className="bubble-nick">{msg.nickname}</div>}
-      {/* 말풍선과 취소 버튼을 한 줄로 묶는다. 내 메시지는 오른쪽에 붙으므로
-          버튼이 말풍선 왼쪽(대화창 가운데 쪽)에 놓인다. */}
-      <div className="bubble-line">
-        {onCancel && (
-          <button className="msg-cancel" onClick={onCancel} title="취소" aria-label="보낸 것 취소">
-            <svg viewBox="0 0 16 16" width="12" height="12" aria-hidden="true">
-              <path
-                d="M4 4l8 8M12 4l-8 8"
-                fill="none"
-                stroke="currentColor"
-                strokeWidth="1.8"
-                strokeLinecap="round"
-              />
-            </svg>
-          </button>
-        )}
-        {msg.kind === "image" ? (
-          <div className="image-wrap">
-            {/* 크기를 미리 박아두면 이미지가 도착하기 전에도 자리가 잡힌다 */}
-            <a
-              className="bubble-image"
-              href={msg.url}
-              target="_blank"
-              rel="noreferrer"
-              style={displaySize(msg.width, msg.height)}
-            >
-              <img src={msg.url} loading="lazy" alt={`${msg.nickname} 님이 보낸 이미지`} />
-            </a>
-            <span className="bubble-time">{time}</span>
-          </div>
-        ) : (
-          <div className="bubble">
-            <span className="bubble-text">{msg.text}</span>
-            <span className="bubble-time">{time}</span>
-          </div>
-        )}
+      {/* 상대에게만 아바타를 붙인다 — 카카오톡처럼 내 쪽에는 없다.
+          프로필 사진이 없으니 닉네임 첫 글자가 얼굴 노릇을 한다. */}
+      {!mine && (
+        <div className="avatar" aria-hidden>
+          {msg.nickname.slice(0, 1)}
+        </div>
+      )}
+      <div className="bubble-col">
+        {!mine && <div className="bubble-nick">{msg.nickname}</div>}
+        {/* 말풍선·시간·취소 버튼을 한 줄로. 시간은 말풍선 밖 아래쪽에 붙는다.
+            내 메시지는 오른쪽 정렬이라 시간(과 취소 버튼)이 말풍선 왼쪽
+            (대화창 가운데 쪽)에 놓인다 — 카카오톡과 같은 배치다. */}
+        <div className="bubble-line">
+          {onCancel && (
+            <button className="msg-cancel" onClick={onCancel} title="취소" aria-label="보낸 것 취소">
+              <svg viewBox="0 0 16 16" width="12" height="12" aria-hidden="true">
+                <path
+                  d="M4 4l8 8M12 4l-8 8"
+                  fill="none"
+                  stroke="currentColor"
+                  strokeWidth="1.8"
+                  strokeLinecap="round"
+                />
+              </svg>
+            </button>
+          )}
+          {mine && <span className="bubble-time">{time}</span>}
+          {body}
+          {!mine && <span className="bubble-time">{time}</span>}
+        </div>
       </div>
     </div>
   );

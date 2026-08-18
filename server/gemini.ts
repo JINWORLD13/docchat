@@ -1,11 +1,13 @@
 import { GoogleGenAI } from "@google/genai";
-import { getCached, setCached } from "./cache.ts";
 import { faults } from "./faults.ts";
-import type { AnswerChunk, RetrievedChunk } from "./types.ts";
+import { buildAnswerPrompt } from "./prompt.ts";
+import type { AnswerChunk, QuestionImage, RetrievedChunk } from "./types.ts";
 
 const ai = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY });
 
-const EMBEDDING_MODEL = "gemini-embedding-001";
+// embedding.ts가 캐시 키에 쓴다 — 공급자·모델이 다르면 같은 질문이라도
+// 다른 벡터라, 키에 모델이 안 들어가면 남의 공간 벡터를 돌려주게 된다.
+export const EMBEDDING_MODEL = "gemini-embedding-001";
 const CHAT_MODEL = process.env.GEMINI_CHAT_MODEL || "gemini-3.6-flash";
 
 // pgvector 컬럼 차원과 맞춰야 한다 (schema.sql의 vector(768))
@@ -106,42 +108,18 @@ export async function embedTexts(
   });
 }
 
-export async function embedQuery(text: string): Promise<number[]> {
-  // 같은 질문이면 캐시된 벡터를 그대로 쓴다 → 임베딩 API 호출을 건너뜀.
-  // 문서 저장(RETRIEVAL_DOCUMENT)은 한 번뿐이라 캐싱 이득이 없고,
-  // 질문(RETRIEVAL_QUERY)은 반복되므로 여기만 캐싱한다.
-  const key = "q:" + text;
-  const cached = getCached<number[]>(key);
-  if (cached) return cached;
-
-  const [vector] = await embedTexts([text], "RETRIEVAL_QUERY");
-  if (!vector) throw new Error("질문 임베딩을 만들지 못했습니다.");
-  setCached(key, vector);
-  return vector;
-}
+// 질문 임베딩(+캐시)은 embedding.ts로 옮겼다 — 공급자(Gemini·Ollama)를
+// 고르는 일과 캐시는 벤더 파일이 아니라 그 라우팅 층의 몫이라서다.
 
 export async function streamAnswer(
   question: string,
   contexts: RetrievedChunk[],
-  signal?: AbortSignal
+  signal?: AbortSignal,
+  image?: QuestionImage
 ): Promise<AsyncIterable<AnswerChunk>> {
-  const contextBlock = contexts
-    .map((c, i) => `[${i + 1}] (출처: ${c.filename})\n${c.content}`)
-    .join("\n\n");
-
-  const prompt = `당신은 사용자가 업로드한 문서를 근거로 답하는 어시스턴트입니다.
-
-규칙:
-- 아래 발췌 내용만 근거로 답합니다. 발췌에 없는 내용은 추측하지 말고 문서에 없다고 답하세요.
-- 근거로 사용한 발췌 번호를 문장 끝에 [1], [2] 형태로 표시하세요.
-- 한국어로 간결하게 답하세요.
-- 굵게(**), 제목(#), 별표 목록(*) 같은 마크다운 서식은 쓰지 마세요.
-  평범한 문장으로 답하고, 항목을 나열할 땐 줄바꿈만 쓰세요.
-
-발췌:
-${contextBlock}
-
-질문: ${question}`;
+  // 프롬프트는 생성기들이 공유한다(prompt.ts). 로컬 모델로 폴백해도
+  // 같은 규칙(근거·인용·형식)으로 답해야 하기 때문이다.
+  const prompt = buildAnswerPrompt(question, contexts, image !== undefined);
 
   // 장애 주입 스위치. 대시보드 버튼으로 faults.llmFail을 켜면 생성이 실패한다.
   // 죽은 의존성이 타임아웃까지 매달리는 상황을 흉내내려고 잠깐 지연 후 던진다.
@@ -153,6 +131,23 @@ ${contextBlock}
   }
 
   if (PROVIDER === "mock") return mockStream();
+
+  // 이미지는 base64 inline 파트로 프롬프트와 함께 보낸다.
+  // Buffer.from(뷰)가 아니라 (buffer, offset, length)로 만드는 이유:
+  // 앞의 모양은 바이트를 복사하고, 이 모양은 같은 메모리를 그대로 본다.
+  // 어차피 base64 문자열로 바뀌는 순간 복사가 한 번 일어나므로 그 앞의
+  // 복사는 순수한 낭비다(최대 2MB).
+  const contents = image
+    ? [
+        { text: prompt },
+        {
+          inlineData: {
+            mimeType: image.mime,
+            data: Buffer.from(image.data.buffer, image.data.byteOffset, image.data.byteLength).toString("base64"),
+          },
+        },
+      ]
+    : prompt;
 
   // 스트림을 여는 것까지만 재시도한다. 일단 토큰이 흘러나오기 시작하면
   // (chat.ts에서 for await로 소비) 중간에 재시도할 수 없다.
@@ -169,7 +164,7 @@ ${contextBlock}
     () =>
       ai.models.generateContentStream({
         model: CHAT_MODEL,
-        contents: prompt,
+        contents,
         config: { abortSignal: signal, httpOptions: { timeout: STREAM_TIMEOUT_MS } },
       }),
     "생성"

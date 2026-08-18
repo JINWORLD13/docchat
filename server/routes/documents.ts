@@ -4,7 +4,10 @@ import type pg from "pg";
 // 문서 업로드·수정·삭제·조회는 쓰기 풀(관리 경로). 질문 검색용 읽기 풀과 격리한다.
 import { writePool as pool } from "../db.ts";
 import { chunkText } from "../chunk.ts";
-import { embedTexts } from "../gemini.ts";
+// gemini.ts가 아니라 embedding.ts에서 가져온다. 문서와 질문은 반드시 같은
+// 모델로 임베딩돼야 검색이 성립하는데(벡터 공간 — embedding.ts 주석), 여기가
+// 벤더 모듈을 직접 부르면 EMBEDDER 스위치가 질문에만 적용되는 사고가 난다.
+import { embedDocuments } from "../embedding.ts";
 import { requireWriteAccess } from "../admin.ts";
 
 const router = Router();
@@ -67,7 +70,7 @@ async function chunkAndEmbed(text: string): Promise<EmbedResult> {
 
   const embeddings: number[][] = [];
   for (let i = 0; i < chunks.length; i += EMBED_BATCH) {
-    embeddings.push(...(await embedTexts(chunks.slice(i, i + EMBED_BATCH))));
+    embeddings.push(...(await embedDocuments(chunks.slice(i, i + EMBED_BATCH))));
   }
   return { tooLarge: false, chunks, embeddings };
 }

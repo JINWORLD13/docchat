@@ -74,3 +74,45 @@ create table if not exists query_logs (
 -- 이 테이블은 질문마다 한 줄씩 영원히 쌓이는 유일한 테이블이므로,
 -- 인덱스가 없으면 시간이 갈수록 그 조회가 느려진다.
 create index if not exists query_logs_created_at_idx on query_logs (created_at desc);
+
+-- ---------- 계정 ----------
+--
+-- 지금까지 신원은 "이 브라우저"(clientKey HMAC — realtime/identity.ts)였다.
+-- 메신저가 되려면 신원이 기기를 넘어 유지돼야 하고, DM의 수신자·읽음 표시의
+-- 주체·대화 기록의 작성자가 전부 이 id를 가리킨다.
+create table if not exists users (
+  -- uuid인 이유: 대화 상대에게 노출되는 값이라(작성자 표시) 연속 정수면
+  -- 가입 순서와 규모가 새고, 번호를 바꿔가며 프로필을 훑을 수 있다.
+  id uuid primary key,
+  -- 로그인 아이디. 소문자로 정규화해 저장한다 — Kim과 kim이 다른 계정이 되면
+  -- 로그인 실패의 원인을 본인도 알 수 없다.
+  username text not null unique,
+  -- scrypt(소금:해시, server/auth.ts). 게스트 계정은 로그인이 불가능해야 하므로
+  -- 어떤 비밀번호와도 일치할 수 없는 빈 값을 둔다.
+  password_hash text not null,
+  -- 대화에서 보이는 이름. 로그인 아이디와 분리한다 — 아이디는 바꿀 수 없지만
+  -- 보이는 이름은 바꿀 수 있어야 하고, 아이디를 화면에 뿌리면 로그인 자격의
+  -- 절반(아이디+비밀번호 중 아이디)을 방 전체에 공개하는 셈이다.
+  display_name text not null,
+  -- 한 번 눌러 들어온 손님. 포트폴리오 데모는 가입 없이 바로 써봐야 하므로
+  -- 게스트도 정식 user 행으로 만든다 — 그래야 메시지·읽음·DM의 모든 로직이
+  -- "user가 아닐 수도 있는" 분기 없이 한 가지 모양으로 돈다.
+  is_guest boolean not null default false,
+  created_at timestamptz not null default now()
+);
+
+-- 로그인 세션. 토큰은 httpOnly 쿠키로만 오간다(server/auth.ts).
+-- JWT 대신 DB 세션인 이유: 로그아웃이 "정말로" 로그아웃이어야 해서다.
+-- JWT는 서버가 잊을 방법이 없어 만료까지 유효한데, 그러면 공용 PC에서
+-- 로그아웃해도 토큰을 복사해둔 사람이 계속 그 사람이다.
+create table if not exists sessions (
+  -- 토큰 자체를 키로 쓴다. 256비트 무작위라 추측이 불가능하고,
+  -- 조회가 전부 "토큰으로 찾기"라 별도 인덱스도 필요 없다.
+  token text primary key,
+  user_id uuid not null references users(id) on delete cascade,
+  created_at timestamptz not null default now(),
+  expires_at timestamptz not null
+);
+
+-- 만료 세션 청소(cleanupSessions)가 훑는 축.
+create index if not exists sessions_expires_at_idx on sessions (expires_at);

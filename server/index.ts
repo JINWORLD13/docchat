@@ -6,14 +6,22 @@ import { createServer } from "node:http";
 import documentsRouter from "./routes/documents.ts";
 import chatRouter from "./routes/chat.ts";
 import imagesRouter from "./routes/images.ts";
+import kakaoRouter from "./routes/kakao.ts";
+import authRouter from "./routes/auth.ts";
 import { readPool, writePool, mediaPool, poolStats } from "./db.ts";
 import { cacheStats } from "./cache.ts";
 import { rateLimit, rateLimitStats } from "./ratelimit.ts";
 import { admissionStats } from "./admission.ts";
-import { breakerState, embed as embedBreaker, reset as resetBreaker } from "./breaker.ts";
+import {
+  breakerState,
+  embed as embedBreaker,
+  local as localBreaker,
+  reset as resetBreaker,
+} from "./breaker.ts";
 import { faults } from "./faults.ts";
 import { requireAdmin, adminMode } from "./admin.ts";
 import { isAllowedOrigin } from "./origins.ts";
+import { requireLogin } from "./auth.ts";
 import { attachRealtime } from "./realtime/gateway.ts";
 import { roomStats } from "./realtime/rooms.ts";
 import { chatRateLimitStats } from "./realtime/ratelimit.ts";
@@ -85,6 +93,13 @@ app.get("/api/health", (_req, res) => {
 // 방어 레이어들의 상태를 한눈에 노출한다.
 // 모니터링이 곧 결정력 — 장애 상황에서 어느 레이어가 발동했는지 몇 초 안에
 // 파악하려면 이 값들이 보여야 한다. (프로덕션은 Prometheus + Grafana)
+//
+// 로그인을 요구하지 않는 유일한 API다. 일부러 그렇게 뒀다.
+// 여기 담기는 건 전부 집계 수치(적중률·풀 대기·거절 수·회로 상태)라 사용자
+// 데이터도 문서 내용도 들어가지 않고, 반대로 이 값을 읽는 쪽에는 브라우저가
+// 아닌 것들이 있다 — 부하 측정(scripts/load-chat.ts)과 시연(demo-defense.ts),
+// 그리고 배포 환경의 상태 확인이다. 관측 지점을 로그인 뒤로 넣으면 정작
+// "로그인이 안 된다"는 장애를 이 화면으로 진단할 수 없게 된다.
 app.get("/api/metrics", (_req, res) => {
   const s = cacheStats();
   const total = s.hits + s.misses;
@@ -108,6 +123,9 @@ app.get("/api/metrics", (_req, res) => {
     admission: admissionStats(), // 과부하 제어: 처리 중/대기 수
     breaker: breakerState(), // 회로차단(생성): 열림 여부, 연속 실패 수
     embedBreaker: embedBreaker.state(), // 회로차단(임베딩)
+    // 회로차단(로컬 생성). 열려 있다는 건 온디바이스가 죽어 모든 질문이
+    // 보루(Gemini)로 가고 있다는 뜻이다 — 지표 없이는 알아챌 수 없는 상태.
+    localBreaker: localBreaker.state(),
     // 실시간 채팅: 방/접속자 수, 도배로 막힌 메시지 수
     realtime: { ...roomStats(), messagesRejected: chatRateLimitStats().rejected },
     faults, // 현재 주입된 장애 상태 (llmFail)
@@ -128,17 +146,39 @@ app.post("/api/admin/reset", requireAdmin, (_req, res) => {
   res.json({ ok: true });
 });
 
+// 제한 → 로그인 → 라우터 순서다. 순서에 이유가 있다.
+//
+// requireLogin은 세션을 확인하느라 DB를 볼 수 있다(캐시에 없는 토큰일 때 —
+// auth.ts). 그걸 rateLimit 앞에 두면, 아무 값이나 64자리 hex로 지어낸 쿠키를
+// 달고 쏘는 것만으로 요청당 세션 조회 한 번씩을 강제할 수 있다. 로그인도 안 된
+// 요청이 DB 왕복을 만드는 셈이라, 문을 달았더니 그 문이 증폭기가 되는 꼴이다.
+// 메모리에서 끝나는 검사(rateLimit)를 먼저 통과시킨 뒤에 DB를 본다.
+// (routes/chat.ts가 "잘못된 요청이 처리 슬롯을 잡아먹지 않게" 검증을 admission
+//  앞에 두는 것과 같은 기준 — 싼 검사가 비싼 검사보다 앞이다.)
+
 // 문서 경로도 같은 사용자별 제한을 태운다. 질문과 예산을 공유하게 되는데,
 // 그 편이 낫다고 봤다 — 어차피 한 사람이 쓸 수 있는 총량을 정하는 게 목적이고,
 // 목록 조회는 매번 chunks 전체를 조인하므로 공짜가 아니다.
-// 변경(추가·수정·삭제)은 라우터 안에서 한 겹 더 막는다(requireWriteAccess).
-app.use("/api/documents", rateLimit, documentsRouter);
+// 변경(추가·수정·삭제)은 라우터 안에서 한 겹 더 막는다(requireWriteAccess) —
+// 로그인은 "누구든 들어온 사람"이고 그쪽은 "코퍼스를 바꿔도 되는 사람"이라,
+// 두 문은 겹치는 게 아니라 서로 다른 것을 막는다.
+app.use("/api/documents", rateLimit, requireLogin, documentsRouter);
 // 이미지는 /api/chat보다 먼저 붙인다. 뒤에 두면 질문용 rate limiter를 먼저
 // 통과해야 해서, 사진 몇 장 올린 것 때문에 정작 질문이 막히게 된다.
 // 업로드에는 성격에 맞는 별도 제한이 라우터 안에 따로 있다.
+// 로그인 검사도 그 제한 뒤에 있다(routes/images.ts) — 위와 같은 순서 이유다.
 app.use("/api/chat/image", imagesRouter);
 // rateLimit을 chat 앞단에 둔다: 맨 먼저 사용자별 폭주를 걸러낸 뒤 라우터로 넘긴다.
-app.use("/api/chat", rateLimit, chatRouter);
+app.use("/api/chat", rateLimit, requireLogin, chatRouter);
+
+// 카카오톡 스킬 웹훅. IP 기반 rateLimit을 일부러 안 태운다 — 요청이 전부
+// 카카오 서버 IP로 오므로 IP당 제한이 "전체 사용자 공용" 제한이 되고, 사용자
+// 몇 명이 동시에 물어보면 서로를 막는다. 대신 라우터 안에서 카카오 사용자
+// id로 같은 성격의 제한을 건다.
+app.use("/api/kakao", kakaoRouter);
+
+// 계정. 질문용 rateLimit 대신 라우터 안의 전용 제한(비밀번호 추측 방어)을 쓴다.
+app.use("/api/auth", authRouter);
 
 // 프런트 빌드 결과물(web/dist)을 같은 오리진에서 서빙한다.
 // 배포를 Netlify/Render로 나누지 않고 이 서버 하나로 합친 이유: web/api.ts와

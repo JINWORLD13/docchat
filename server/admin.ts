@@ -34,11 +34,18 @@ function isLoopback(req: Request): boolean {
 
 // 위 두 단계를 그대로 쓰되 거절 문구만 용도에 맞게 바꾼다.
 // 문구가 중요한 이유는, 막혔을 때 무엇을 해야 하는지가 화면에 그대로 뜨기 때문이다.
+// 토큰이 틀렸을 때 401이 아니라 403인 이유:
+//
+// 401은 이 API에서 딱 한 가지 뜻으로 쓴다 — "세션이 없다"(auth.ts의 requireLogin).
+// 프런트가 그 코드를 보고 로그인 화면으로 돌아가기 때문에, 다른 이유로도 401을
+// 내보내면 관리자 토큰을 잘못 넣은 사람이 멀쩡한 세션째로 로그아웃당한다.
+// 여기서 막히는 건 신원이 아니라 권한이고(문서 변경 경로는 이미 requireLogin을
+// 지나온 뒤다), 그건 403이 맞다. 아래 루프백 거절이 원래 403인 것과도 맞춰진다.
 function protect(what: string): RequestHandler {
   return (req, res, next) => {
     if (ADMIN_TOKEN) {
       if (!tokenMatches(req.get("x-admin-token"))) {
-        res.status(401).json({ error: `${what}에는 관리자 토큰이 필요합니다.` });
+        res.status(403).json({ error: `${what}에는 관리자 토큰이 필요합니다.` });
         return;
       }
       next();

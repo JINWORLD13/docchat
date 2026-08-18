@@ -4,6 +4,7 @@ import type {
   ChatHandlers,
   DocumentDetail,
   DocumentSummary,
+  Me,
   MetricsResponse,
 } from "./types";
 
@@ -14,6 +15,35 @@ const BASE = "/api";
 // 서버 응답을 믿는다는 결정이 어디서 일어나는지 한눈에 보이게 하려고.
 async function readJson<T>(res: Response): Promise<T> {
   return (await res.json()) as T;
+}
+
+// --- 세션이 끊겼을 때 ---
+//
+// 서버는 401을 딱 한 가지 뜻으로만 쓴다: "유효한 세션이 없다"(server/auth.ts의
+// requireLogin). 권한 부족(관리자 토큰)은 403이라 여기 섞이지 않는다.
+// 그래서 401은 "이 요청이 실패했다"가 아니라 "지금 로그인 상태가 아니다"로
+// 읽어야 한다 — 그걸 요청별 오류 문구로 처리하면, 세션이 만료된 사람에게
+// "문서 목록을 불러오지 못했습니다"가 뜨고 새로고침해도 같은 화면이 반복된다.
+// 원인이 로그인인데 화면은 그 말을 한 번도 하지 않는 상태가 된다.
+//
+// App이 여기에 "AuthGate로 돌아가기"를 등록한다(App.tsx).
+let onSessionExpired: (() => void) | null = null;
+
+export function setSessionExpiredHandler(fn: () => void): void {
+  onSessionExpired = fn;
+}
+
+// 소켓 핸드셰이크가 거절당했을 때도 같은 곳으로 온다(realtime/LiveChat.tsx).
+// 채팅 탭에만 앉아 있으면 HTTP 요청이 아예 안 나가서 401을 만날 일이 없다.
+export function notifySessionExpired(): void {
+  onSessionExpired?.();
+}
+
+// 로그인이 필요한 요청의 응답을 확인한다.
+// 로그인·가입·게스트·me는 401이 정상 신호(자격 불일치 / 아직 로그인 안 됨)라
+// 여기를 통과시키지 않는다.
+function checkSession(res: Response): void {
+  if (res.status === 401) notifySessionExpired();
 }
 
 // 에러 응답의 { error: "..." }를 꺼낸다. 본문이 JSON이 아닐 수도 있어 감싼다.
@@ -28,15 +58,70 @@ async function errorMessage(res: Response, fallback: string): Promise<string> {
 
 // 문서를 바꾸는 요청(추가·수정·삭제)에 붙이는 헤더.
 //
-// 서버는 이 세 가지를 관리자 스위치와 같은 규칙으로 막는다(server/admin.ts).
-// 로컬 데모는 루프백이라 토큰 없이 통과하고, 배포하면 토큰이 있어야 한다.
-// 읽기(목록·상세)는 그대로 열려 있으므로 여기 붙이지 않는다.
+// 서버는 이 세 가지를 관리자 스위치와 같은 규칙으로 한 겹 더 막는다
+// (server/admin.ts). 로컬 데모는 루프백이라 토큰 없이 통과하고, 배포하면
+// 토큰이 있어야 한다.
+//
+// 읽기(목록·상세)에는 이 헤더를 안 붙인다. 읽기가 열려 있어서가 아니라 —
+// 이제 문서 경로는 전부 로그인을 요구한다(server/index.ts) — 그 문을 세션
+// 쿠키가 알아서 지나기 때문이다. 이 토큰이 답하는 질문은 "들어온 사람인가"가
+// 아니라 "코퍼스를 바꿔도 되는 사람인가"라서, 읽기에는 물을 이유가 없다.
 function writeHeaders(base: Record<string, string> = {}): Record<string, string> {
   return ADMIN_TOKEN ? { ...base, "x-admin-token": ADMIN_TOKEN } : base;
 }
 
+// --- 계정 ---
+// 쿠키(httpOnly 세션)는 같은 오리진 fetch에 자동으로 실린다. 토큰을 다루는
+// 코드가 클라이언트에 없는 이유다(server/auth.ts의 쿠키 주석).
+
+export async function fetchMe(): Promise<Me | null> {
+  const res = await fetch(`${BASE}/auth/me`);
+  if (res.status === 401) return null; // 로그인 안 됨 — 오류가 아니라 상태다
+  if (!res.ok) throw new Error("로그인 상태를 확인하지 못했습니다.");
+  return readJson<Me>(res);
+}
+
+export async function guestLogin(displayName: string): Promise<Me> {
+  const res = await fetch(`${BASE}/auth/guest`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ displayName }),
+  });
+  if (!res.ok) throw new Error(await errorMessage(res, "입장에 실패했습니다."));
+  return readJson<Me>(res);
+}
+
+export async function login(username: string, password: string): Promise<Me> {
+  const res = await fetch(`${BASE}/auth/login`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ username, password }),
+  });
+  if (!res.ok) throw new Error(await errorMessage(res, "로그인에 실패했습니다."));
+  return readJson<Me>(res);
+}
+
+export async function signup(
+  username: string,
+  password: string,
+  displayName: string
+): Promise<Me> {
+  const res = await fetch(`${BASE}/auth/signup`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ username, password, displayName }),
+  });
+  if (!res.ok) throw new Error(await errorMessage(res, "가입에 실패했습니다."));
+  return readJson<Me>(res);
+}
+
+export async function logout(): Promise<void> {
+  await fetch(`${BASE}/auth/logout`, { method: "POST" });
+}
+
 export async function fetchDocuments(): Promise<DocumentSummary[]> {
   const res = await fetch(`${BASE}/documents`);
+  checkSession(res);
   if (!res.ok) throw new Error("문서 목록을 불러오지 못했습니다.");
   return readJson<DocumentSummary[]>(res);
 }
@@ -49,12 +134,14 @@ export async function uploadDocument(file: File): Promise<{ id: number; filename
     headers: writeHeaders(),
     body: form,
   });
+  checkSession(res);
   if (!res.ok) throw new Error(await errorMessage(res, "업로드에 실패했습니다."));
   return readJson(res);
 }
 
 export async function fetchDocument(id: number): Promise<DocumentDetail> {
   const res = await fetch(`${BASE}/documents/${id}`);
+  checkSession(res);
   if (!res.ok) throw new Error(await errorMessage(res, "문서를 불러오지 못했습니다."));
   return readJson<DocumentDetail>(res);
 }
@@ -65,6 +152,7 @@ export async function updateDocument(id: number, content: string): Promise<void>
     headers: writeHeaders({ "Content-Type": "application/json" }),
     body: JSON.stringify({ content }),
   });
+  checkSession(res);
   if (!res.ok) throw new Error(await errorMessage(res, "수정에 실패했습니다."));
 }
 
@@ -73,6 +161,7 @@ export async function deleteDocument(id: number): Promise<void> {
     method: "DELETE",
     headers: writeHeaders(),
   });
+  checkSession(res);
   if (!res.ok) throw new Error(await errorMessage(res, "삭제에 실패했습니다."));
 }
 
@@ -96,6 +185,7 @@ export async function uploadChatImage(
   form.append("height", String(height));
 
   const res = await fetch(`${BASE}/chat/image`, { method: "POST", body: form });
+  checkSession(res);
   if (!res.ok) throw new Error(await errorMessage(res, "이미지 업로드에 실패했습니다."));
   return readJson<{ id: string }>(res);
 }
@@ -148,6 +238,7 @@ export async function burst(count: number, question = "환불은 며칠 걸려?"
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ question }),
       });
+      checkSession(res);
       if (res.status === 429) {
         await res.text().catch(() => "");
         return "rejected";
@@ -214,14 +305,18 @@ function dispatch(event: ChatEvent, handlers: ChatHandlers): void {
 export async function streamChat(
   question: string,
   handlers: ChatHandlers,
-  signal?: AbortSignal
+  signal?: AbortSignal,
+  // 질문에 첨부한 이미지. uploadChatImage로 먼저 올리고 받은 id를 싣는다 —
+  // 바이트를 여기 실으면 같은 이미지로 질문을 고쳐 물을 때마다 2MB가 다시 간다.
+  imageId?: string
 ): Promise<void> {
   const res = await fetch(`${BASE}/chat`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ question }),
+    body: JSON.stringify(imageId ? { question, imageId } : { question }),
     signal,
   });
+  checkSession(res);
   if (!res.ok) throw new Error(await errorMessage(res, "요청에 실패했습니다."));
   if (!res.body) throw new Error("스트림을 열 수 없습니다.");
 

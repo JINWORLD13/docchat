@@ -88,6 +88,16 @@ export default function Dashboard() {
         if (p && p.breaker.open && !data.breaker.open) {
           addLog("Circuit Breaker 닫힘 — 정상 복구", "ok");
         }
+        // 로컬 생성 회로. 이전 지표에 필드가 없을 수 있다(서버가 구버전으로
+        // 도는 동안 받은 스냅샷) — 그때는 전이를 판단하지 않는다.
+        if (p?.localBreaker && data.localBreaker) {
+          if (!p.localBreaker.open && data.localBreaker.open) {
+            addLog("로컬 생성 회로 열림 — 질문이 보루(Gemini)로 갑니다", "danger");
+          }
+          if (p.localBreaker.open && !data.localBreaker.open) {
+            addLog("로컬 생성 회로 닫힘 — 온디바이스 복구", "ok");
+          }
+        }
         lastMetrics = data;
         setM(data);
         if (Date.now() >= holdFaultUntil.current) setFaultOn(data.faults.llmFail);
@@ -167,6 +177,7 @@ export default function Dashboard() {
   const ad = m?.admission;
   const br = m?.breaker;
   const eb = m?.embedBreaker;
+  const lb = m?.localBreaker;
   const rt = m?.realtime;
 
   return (
@@ -239,9 +250,9 @@ export default function Dashboard() {
           // 회로가 둘인 이유: 질문 경로가 외부로 나가는 지점이 둘이다(임베딩·생성).
           // 예전엔 생성만 감싸고 있어서, 임베딩 API가 죽으면 회로가 영영 안 열린 채
           // 요청마다 재시도를 다 소진하고 실패했다. 화면에도 "닫힘"으로만 보였다.
-          sub="외부 API 장애 자동 차단 (임베딩 · 생성)"
-          active={(br?.open ?? false) || (eb?.open ?? false)}
-          danger={(br?.open ?? false) || (eb?.open ?? false)}
+          sub="외부 API·로컬 모델 장애 자동 차단 (임베딩 · 생성 · 로컬)"
+          active={(br?.open ?? false) || (eb?.open ?? false) || (lb?.open ?? false)}
+          danger={(br?.open ?? false) || (eb?.open ?? false) || (lb?.open ?? false)}
           stat={
             (br?.open
               ? `생성 열림 · ${Math.ceil(br.reopensInMs / 1000)}s 후 재시도`
@@ -250,6 +261,13 @@ export default function Dashboard() {
               ? ` · 임베딩 열림 · ${Math.ceil(eb.reopensInMs / 1000)}s`
               : (eb?.consecutiveFailures ?? 0) > 0
                 ? ` · 임베딩 실패 ${eb?.consecutiveFailures}`
+                : "") +
+            // 로컬 회로는 체인에 ollama를 넣었을 때만 움직인다. 깨끗할 때는
+            // 표시하지 않는다 — 안 쓰는 기능의 지표로 줄을 채울 이유가 없다.
+            (lb?.open
+              ? ` · 로컬 열림(보루로 폴백) · ${Math.ceil(lb.reopensInMs / 1000)}s`
+              : (lb?.consecutiveFailures ?? 0) > 0
+                ? ` · 로컬 실패 ${lb?.consecutiveFailures}`
                 : "")
           }
         />

@@ -4,9 +4,9 @@
 interface ChatMessageBase {
   id: string;
   room: string;
-  nickname: string; // 화면에 보이는 이름. 아무나 같은 값을 쓸 수 있다.
-  // 보낸 사람의 공개 신원. "내 것인가"(취소 버튼)를 이걸로 판단한다.
-  // 닉네임으로 판단하면 같은 이름을 쓴 사람의 메시지까지 내 것으로 보인다.
+  nickname: string; // 화면에 보이는 이름 (계정의 표시 이름)
+  // 보낸 사람의 신원 — 계정의 user id. "내 것인가"(취소 버튼)를 이걸로 판단한다.
+  // 이름으로 판단하면 같은 이름을 쓴 사람의 메시지까지 내 것으로 보인다.
   authorId: string;
   ts: number;
 }
@@ -32,9 +32,9 @@ export interface RoomSummary {
 }
 
 // 클라이언트 → 서버
+// (hello가 없어진 이유: 신원은 핸드셰이크의 세션 쿠키가 증명한다.
+//  서버 realtime/types.ts 주석 참고)
 export interface ClientToServer {
-  // clientKey는 이 탭의 비밀값(session.ts). 서버가 이걸로 신원을 만든다.
-  hello: (payload: { nickname: string; clientKey?: string }) => void;
   join: (payload: { room: string }) => void;
   leave: () => void;
   deleteRoom: (payload: { room: string }) => void; // 방 삭제 (방장만)
@@ -47,8 +47,8 @@ export interface ClientToServer {
 }
 
 // 서버 → 클라이언트
+// (me가 없어진 이유: 내 id는 로그인 응답이 알려준다 — ../types.ts의 Me)
 export interface ServerToClient {
-  me: (authorId: string) => void; // 내 공개 신원 (hello 직후 나에게만)
   rooms: (rooms: RoomSummary[]) => void;
   history: (messages: ChatMessage[]) => void;
   message: (message: ChatMessage) => void;

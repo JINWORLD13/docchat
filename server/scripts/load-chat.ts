@@ -6,25 +6,32 @@
 // 사용법: CONN=20 DUR=10 node scripts/load-chat.ts
 import autocannon from "autocannon";
 import type { MetricsResponse } from "../types.ts";
+import { guestCookie } from "./session.ts";
 
 const CONN = Number(process.env.CONN || 20); // 동시 연결 수 (트래픽 폭주 정도)
 const DUR = Number(process.env.DUR || 10); // 몇 초 동안
+const BASE = process.env.LOADTEST_URL || "http://localhost:4000";
 
 async function metrics(): Promise<MetricsResponse | null> {
   try {
-    return (await (await fetch("http://localhost:4000/api/metrics")).json()) as MetricsResponse;
+    return (await (await fetch(`${BASE}/api/metrics`)).json()) as MetricsResponse;
   } catch {
     return null;
   }
 }
 
+// 질문 경로가 로그인을 요구하므로 먼저 게스트로 입장해 세션 쿠키를 받는다.
+// 이걸 안 붙이면 전 요청이 401로 튕기면서 "처리량 폭증"처럼 보이는 숫자가
+// 나온다 — 실제로는 아무 일도 하지 않은 응답이라 측정이 통째로 거짓이 된다.
+const cookie = await guestCookie(BASE, "loadtest");
+
 console.log(`부하: 동시 ${CONN}, ${DUR}초\n`);
 
 const instance = autocannon(
   {
-    url: "http://localhost:4000/api/chat",
+    url: `${BASE}/api/chat`,
     method: "POST",
-    headers: { "Content-Type": "application/json" },
+    headers: { "Content-Type": "application/json", cookie },
     body: JSON.stringify({ question: "환불은 며칠 걸려?" }),
     connections: CONN,
     duration: DUR,

@@ -3,6 +3,7 @@ import multer from "multer";
 import { sniffImage } from "../imagetype.ts";
 import { saveImage, loadImage } from "../images.ts";
 import { TokenBuckets } from "../tokenbucket.ts";
+import { requireLogin } from "../auth.ts";
 
 const router = Router();
 
@@ -89,7 +90,10 @@ const limitViews: RequestHandler = (req, res, next) => {
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
 // --- 업로드 ---
-router.post("/", limitUploads, upload.single("image"), async (req, res) => {
+// limitUploads(메모리) → requireLogin(세션, DB일 수 있음) → multer(바이트 수신) 순서.
+// 로그인을 multer 앞에 두는 게 핵심이다. 뒤에 두면 거절할 요청의 2MB를 이미 다
+// 받아 메모리에 올린 뒤에야 401을 내게 된다.
+router.post("/", limitUploads, requireLogin, upload.single("image"), async (req, res) => {
   if (!req.file) {
     res.status(400).json({ error: "이미지가 없습니다." });
     return;
@@ -115,7 +119,11 @@ router.post("/", limitUploads, upload.single("image"), async (req, res) => {
 });
 
 // --- 조회 ---
-router.get("/:id", limitViews, async (req, res) => {
+// 조회도 로그인을 요구한다. uuid라 주소를 추측할 수는 없지만, 추측 불가와
+// 비공개는 다르다 — 주소는 방 전체에 브로드캐스트되고 새 탭으로 열리고
+// 복사돼 나간다. "보낸 것 취소"가 바이트까지 지우는 이유(images.ts)와 같은
+// 기준이다: 한 번 새어나간 주소가 영원한 열람권이 되면 안 된다.
+router.get("/:id", limitViews, requireLogin, async (req, res) => {
   // 미들웨어가 붙으면서 Express가 params를 넓은 타입으로 주므로 여기서 좁힌다.
   const id = typeof req.params.id === "string" ? req.params.id : "";
   if (!UUID.test(id)) {
@@ -139,7 +147,13 @@ router.get("/:id", limitViews, async (req, res) => {
   // id가 uuid고 내용이 절대 안 바뀌므로 영구 캐시로 준다.
   // 이게 이 기능의 성능 설계 전부다 — 브라우저가 한 번만 받아가면 되니까,
   // 대화가 길어져도 DB까지 오는 건 각 이미지의 첫 요청뿐이다.
-  res.setHeader("Cache-Control", "public, max-age=31536000, immutable");
+  //
+  // public이 아니라 private인 이유: 이 응답은 이제 로그인해야 받을 수 있다.
+  // public은 "중간 캐시(프록시·CDN)가 저장했다가 아무에게나 다시 줘도 된다"는
+  // 뜻이라, 그대로 두면 방금 세운 문을 캐시가 우회시켜 준다 — 로그인 검사를
+  // 통과한 한 사람이 받아온 사진이 캐시에 남아 로그인 없는 요청에 나간다.
+  // 브라우저 자기 캐시에는 그대로 남으므로 위의 성능 설계는 유지된다.
+  res.setHeader("Cache-Control", "private, max-age=31536000, immutable");
 
   res.send(image.bytes);
 });

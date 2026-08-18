@@ -2,9 +2,10 @@ import { useCallback, useEffect, useState } from "react";
 import Sidebar from "./components/Sidebar";
 import Chat from "./components/Chat";
 import Dashboard from "./components/Dashboard";
+import AuthGate from "./components/AuthGate";
 import LiveChat from "./realtime/LiveChat";
-import { fetchDocuments } from "./api";
-import type { DocumentSummary } from "./types";
+import { fetchDocuments, fetchMe, logout, setSessionExpiredHandler } from "./api";
+import type { DocumentSummary, Me } from "./types";
 
 // 탭 목록을 값 하나로 두고 타입을 거기서 뽑아낸다.
 // 이러면 탭을 추가할 때 배열만 고치면 되고, setView("오타") 같은 실수는
@@ -18,9 +19,27 @@ const TABS = [
 type View = (typeof TABS)[number]["id"];
 
 export default function App() {
+  // undefined = 아직 확인 중(첫 요청이 안 돌아옴), null = 로그인 안 됨.
+  // 셋을 구분하는 이유: 확인 중에 AuthGate를 먼저 그리면, 이미 로그인된
+  // 사람도 새로고침할 때마다 로그인 화면이 번쩍였다 사라진다.
+  const [me, setMe] = useState<Me | null | undefined>(undefined);
   const [documents, setDocuments] = useState<DocumentSummary[]>([]);
   const [loadError, setLoadError] = useState<string | null>(null);
   const [view, setView] = useState<View>("chat");
+
+  useEffect(() => {
+    // 세션이 끊기면(만료·다른 탭에서 로그아웃·서버가 세션을 지움) 어느 요청이든
+    // 401을 받는다. 그때 화면 전체를 로그인으로 되돌린다 — 등록을 fetchMe보다
+    // 먼저 하는 이유는, 그 사이에 나간 요청의 401을 놓치지 않기 위해서다.
+    //
+    // setMe(null)을 그대로 넘기지 않고 감싸는 이유: setMe에 함수를 넘기면
+    // React가 그걸 "이전 값으로 다음 값을 만드는 함수"로 해석한다.
+    setSessionExpiredHandler(() => setMe(null));
+
+    fetchMe()
+      .then(setMe)
+      .catch(() => setMe(null));
+  }, []);
 
   const refresh = useCallback(async () => {
     try {
@@ -32,8 +51,18 @@ export default function App() {
   }, []);
 
   useEffect(() => {
-    void refresh();
-  }, [refresh]);
+    if (me) void refresh();
+  }, [me, refresh]);
+
+  async function handleLogout() {
+    await logout().catch(() => undefined); // 실패해도 화면은 로그아웃한다
+    // 새로고침으로 모든 상태(소켓·대화·저장된 방)를 깨끗이 비운다.
+    // state만 지우면 소켓이 옛 세션 쿠키로 붙어 있던 흔적이 남는다.
+    location.reload();
+  }
+
+  if (me === undefined) return null; // 확인 중 — 어차피 수십 ms라 빈 화면이 깜빡임보다 낫다
+  if (!me) return <AuthGate onAuthed={setMe} />;
 
   return (
     <div className="root">
@@ -48,6 +77,13 @@ export default function App() {
             {tab.label}
           </button>
         ))}
+        <div className="topnav-me">
+          <span className="topnav-name">
+            {me.displayName}
+            {me.isGuest && <span className="topnav-guest"> 게스트</span>}
+          </span>
+          <button onClick={() => void handleLogout()}>로그아웃</button>
+        </div>
       </nav>
 
       {/* 문서 Q&A만 언마운트하지 않고 CSS(.tab-hidden)로 가린다.
@@ -71,7 +107,7 @@ export default function App() {
         <Sidebar documents={documents} onChanged={refresh} loadError={loadError} />
         <Chat hasDocuments={documents.length > 0} active={view === "chat"} />
       </div>
-      {view === "live" && <LiveChat />}
+      {view === "live" && <LiveChat me={me} />}
       {view === "dashboard" && <Dashboard />}
     </div>
   );

@@ -1,0 +1,265 @@
+// 계정과 세션.
+//
+// 신원의 근거가 "이 브라우저"(realtime/identity.ts의 clientKey)에서 "이 계정"으로
+// 올라온다. DM의 수신자, 대화 기록의 작성자, 읽음 표시의 주체가 전부 여기의
+// user id를 가리키므로, 메신저의 모든 영속 데이터가 이 파일 위에 선다.
+//
+// 라이브러리를 안 쓴 이유: 필요한 게 비밀번호 해시(node:crypto의 scrypt),
+// 무작위 토큰(randomBytes), 쿠키 문자열 조립뿐이다. passport 같은 프레임워크는
+// 전략·세션 스토어·미들웨어 계층을 통째로 들고 오는데, 그 대부분이 여기선
+// 쓰이지 않는 무게다. 의존성 하나는 공짜가 아니다(버전·취약점·타입을 따라다녀야
+// 한다) — imagetype.ts가 magic bytes를 직접 읽는 것과 같은 판단.
+
+import { randomBytes, randomUUID, scryptSync, timingSafeEqual } from "node:crypto";
+import type { Request, RequestHandler, Response } from "express";
+import { writePool } from "./db.ts";
+import { getCached, setCached, delCached } from "./cache.ts";
+
+// --- 비밀번호 ---
+//
+// scrypt인 이유: 단순 sha256은 GPU로 초당 수십억 번 시도할 수 있어 유출 시
+// 짧은 비밀번호가 그대로 뚫린다. scrypt는 일부러 메모리를 많이 쓰게 설계돼
+// 대량 시도가 비싸다. bcrypt/argon2도 같은 목적이지만 그건 의존성이 필요하고,
+// scrypt는 Node에 내장돼 있다.
+
+const KEY_LEN = 64;
+
+export function hashPassword(password: string): string {
+  const salt = randomBytes(16).toString("hex");
+  const hash = scryptSync(password, salt, KEY_LEN).toString("hex");
+  // 소금을 해시와 같이 보관한다. 소금은 비밀이 아니다 — 목적은 "같은 비밀번호가
+  // 같은 해시가 되는 것"을 막아 무지개표(사전) 공격을 무력화하는 것뿐이다.
+  return `${salt}:${hash}`;
+}
+
+export function verifyPassword(password: string, stored: string): boolean {
+  const [salt, expected] = stored.split(":");
+  // 게스트 계정의 password_hash는 빈 값이다(schema.sql). 어떤 비밀번호로도
+  // 로그인될 수 없어야 하므로 모양이 아니면 즉시 거짓.
+  if (!salt || !expected) return false;
+
+  const actual = scryptSync(password, salt, KEY_LEN).toString("hex");
+  // === 비교는 다른 글자가 나오는 순간 멈춰서, 응답 시간이 "앞에서 몇 글자나
+  // 맞았는지"를 흘린다. 길이가 같은 hex 두 개를 상수 시간으로 비교한다.
+  //
+  // 길이를 먼저 보는 이유: timingSafeEqual은 길이가 다르면 false가 아니라
+  // RangeError를 던진다. 그러면 이 함수는 "안 맞는다"고 답하는 대신 예외로
+  // 빠져나가고, 부르는 쪽(routes/auth.ts)의 401이 통째로 500이 된다.
+  // 상수 시간 비교를 쓴 목적 자체가 무너지는 자리다 — 상태 코드가 갈리는 순간
+  // 응답 시간보다 훨씬 큰 신호로 "그 계정이 있느냐"가 새어나간다.
+  // 길이 비교 자체는 비밀을 흘리지 않는다. 제대로 만든 해시는 언제나
+  // KEY_LEN*2 자리라 길이가 다르다는 건 "저장된 값이 해시 모양이 아니다"는
+  // 뜻일 뿐, 비밀번호가 몇 글자나 맞았는지와는 무관하다.
+  const actualBytes = Buffer.from(actual);
+  const expectedBytes = Buffer.from(expected);
+  if (actualBytes.length !== expectedBytes.length) return false;
+  return timingSafeEqual(actualBytes, expectedBytes);
+}
+
+// 없는 아이디로 로그인을 시도했을 때 시간을 맞추려고 검증시키는 더미 해시.
+//
+// 진짜 해시와 모양이 같아야 한다(소금 + KEY_LEN*2 자리 hex). 모양이 다르면
+// 검증 경로가 도중에 갈라져서 — 앞의 길이 검사에 먼저 걸리거나, 그 전의
+// 모양 검사에서 scrypt를 아예 건너뛰거나 — 있는 아이디와 없는 아이디의
+// 응답 시간이 달라진다. 그러면 로그인 화면이 아이디 수집기가 된다.
+// 여기 두는 이유는 해시 모양을 아는 곳이 이 파일 하나여야 하기 때문이다
+// (KEY_LEN을 바꾸면 이 값도 함께 따라온다).
+export const DUMMY_PASSWORD_HASH = `${"0".repeat(32)}:${"0".repeat(KEY_LEN * 2)}`;
+
+// --- 사용자 ---
+
+export interface SessionUser {
+  id: string;
+  username: string;
+  displayName: string;
+  isGuest: boolean;
+}
+
+// pg의 query<R>가 요구하는 "컬럼명 → 값" 모양 (rag/types.ts의 type 주석과 같은 이유)
+type UserRow = {
+  id: string;
+  username: string;
+  display_name: string;
+  is_guest: boolean;
+};
+
+function toUser(row: UserRow): SessionUser {
+  return {
+    id: row.id,
+    username: row.username,
+    displayName: row.display_name,
+    isGuest: row.is_guest,
+  };
+}
+
+export async function createUser(
+  username: string,
+  passwordHash: string,
+  displayName: string,
+  isGuest: boolean
+): Promise<SessionUser> {
+  const { rows } = await writePool.query<UserRow>(
+    `insert into users (id, username, password_hash, display_name, is_guest)
+     values ($1, $2, $3, $4, $5)
+     returning id, username, display_name, is_guest`,
+    [randomUUID(), username, passwordHash, displayName, isGuest]
+  );
+  const row = rows[0];
+  if (!row) throw new Error("사용자 생성에 실패했습니다.");
+  return toUser(row);
+}
+
+export async function findUserByUsername(
+  username: string
+): Promise<(SessionUser & { passwordHash: string }) | null> {
+  const { rows } = await writePool.query<UserRow & { password_hash: string }>(
+    `select id, username, display_name, is_guest, password_hash
+       from users where username = $1`,
+    [username]
+  );
+  const row = rows[0];
+  return row ? { ...toUser(row), passwordHash: row.password_hash } : null;
+}
+
+// --- 세션 ---
+//
+// 토큰은 httpOnly 쿠키로만 오간다. JS가 못 읽으므로 XSS가 나도 토큰 자체는
+// 훔칠 수 없다(그 브라우저에서 요청을 보내는 것까지는 못 막는다 — 그건
+// sameSite가 다른 사이트발 요청을 거르는 것으로 절반을 막는다).
+
+const SESSION_TTL_MS = 30 * 24 * 60 * 60 * 1000; // 30일
+const COOKIE_NAME = "sid";
+
+// 세션 조회는 모든 인증 요청과 소켓 연결마다 일어난다. 매번 DB를 왕복하면
+// 세션 테이블이 서비스 전체의 병목이 되므로 캐시를 앞에 둔다(TTL 10분 —
+// cache.ts). 로그아웃은 delCached로 즉시 무효화하므로 TTL과 무관하게 맞다.
+const cacheKey = (token: string): string => `session:${token}`;
+
+export async function createSession(user: SessionUser): Promise<string> {
+  const token = randomBytes(32).toString("hex");
+  await writePool.query(
+    `insert into sessions (token, user_id, expires_at) values ($1, $2, $3)`,
+    [token, user.id, new Date(Date.now() + SESSION_TTL_MS)]
+  );
+  setCached(cacheKey(token), user);
+  return token;
+}
+
+export async function sessionUser(token: string): Promise<SessionUser | null> {
+  if (!/^[0-9a-f]{64}$/.test(token)) return null; // 모양부터 (uuid 검사와 같은 이유)
+
+  const cached = getCached<SessionUser>(cacheKey(token));
+  if (cached) return cached;
+
+  const { rows } = await writePool.query<UserRow>(
+    `select u.id, u.username, u.display_name, u.is_guest
+       from sessions s join users u on u.id = s.user_id
+      where s.token = $1 and s.expires_at > now()`,
+    [token]
+  );
+  const row = rows[0];
+  if (!row) return null;
+
+  const user = toUser(row);
+  setCached(cacheKey(token), user);
+  return user;
+}
+
+export async function destroySession(token: string): Promise<void> {
+  delCached(cacheKey(token)); // DB보다 먼저 — 지우다 실패해도 캐시는 이미 죽어 있게
+  await writePool.query(`delete from sessions where token = $1`, [token]);
+}
+
+// 만료 세션 청소. 지우는 사람이 없으면 로그인할 때마다 한 줄씩 영원히 쌓인다
+// (chat_images의 보관 기간 정리와 같은 이유·같은 방식).
+const CLEANUP_INTERVAL_MS = 60 * 60 * 1000;
+const cleaner = setInterval(() => {
+  writePool.query(`delete from sessions where expires_at <= now()`).catch((e: unknown) => {
+    console.error("세션 정리 실패:", e instanceof Error ? e.message : e);
+  });
+}, CLEANUP_INTERVAL_MS);
+cleaner.unref();
+
+// --- 쿠키 ---
+
+// cookie-parser를 안 쓰고 직접 읽는다. 쿠키가 하나(sid)뿐이라 "이름=값을
+// 세미콜론으로 나눈다"가 전부다.
+export function tokenFromCookieHeader(header: string | undefined): string | null {
+  if (!header) return null;
+  for (const part of header.split(";")) {
+    const eq = part.indexOf("=");
+    if (eq < 0) continue;
+    if (part.slice(0, eq).trim() === COOKIE_NAME) return part.slice(eq + 1).trim();
+  }
+  return null;
+}
+
+// 프록시(Render) 뒤에서는 우리에게 닿는 연결이 http라 req.secure가 늘 false다.
+// 프록시가 붙여주는 원래 프로토콜을 본다 (clientip.ts가 IP에 대해 하는 것과 동일).
+function isHttps(req: Request): boolean {
+  const forwarded = req.headers["x-forwarded-proto"];
+  const proto = Array.isArray(forwarded) ? forwarded[0] : forwarded;
+  return req.secure || proto?.split(",")[0]?.trim() === "https";
+}
+
+export function setSessionCookie(req: Request, res: Response, token: string): void {
+  const attrs = [
+    `${COOKIE_NAME}=${token}`,
+    "Path=/",
+    `Max-Age=${Math.floor(SESSION_TTL_MS / 1000)}`,
+    // JS에서 못 읽게. 토큰을 다루는 코드가 클라이언트에 아예 없는 이유다.
+    "HttpOnly",
+    // 다른 사이트에서 시작된 요청에는 안 실린다(CSRF의 절반을 여기서 막는다).
+    // Strict가 아닌 이유: 링크로 들어온 첫 화면도 로그인 상태여야 해서다.
+    "SameSite=Lax",
+  ];
+  // https에서만 Secure를 붙인다. 로컬(http)에서 Secure를 붙이면 브라우저가
+  // 쿠키를 버려서 개발 환경에서만 로그인이 안 되는 미스터리가 된다.
+  if (isHttps(req)) attrs.push("Secure");
+  res.setHeader("Set-Cookie", attrs.join("; "));
+}
+
+export function clearSessionCookie(req: Request, res: Response): void {
+  const attrs = [`${COOKIE_NAME}=`, "Path=/", "Max-Age=0", "HttpOnly", "SameSite=Lax"];
+  if (isHttps(req)) attrs.push("Secure");
+  res.setHeader("Set-Cookie", attrs.join("; "));
+}
+
+// 요청에서 로그인한 사용자를 꺼낸다. 미들웨어로 req에 심는 대신 필요한 곳이
+// 직접 부른다 — Express의 Request 타입을 전역으로 늘리는 마법 없이, 인증이
+// 필요한 자리가 코드에 그대로 보이게.
+export async function userFromRequest(req: Request): Promise<SessionUser | null> {
+  const token = tokenFromCookieHeader(req.headers.cookie);
+  return token ? sessionUser(token) : null;
+}
+
+// 로그인한 사람만 통과시키는 문.
+//
+// 위의 userFromRequest는 "누구인지"를 묻는 함수고, 이건 "들여보낼지"만 정한다.
+// 사용자 객체를 req에 심지 않는 이유는 이 파일 위쪽에 적어둔 것과 같다 —
+// Express의 Request 타입을 전역으로 늘리는 마법 없이, 사용자가 필요한 자리는
+// userFromRequest를 직접 부르게 둔다. 지금 이 문 뒤의 라우트들은 사용자가
+// 누구인지 알 필요가 없다(문서 코퍼스가 공용이라 열람 범위가 갈리지 않는다).
+//
+// 그래서 이건 인증(authentication)까지다. 인가(authorization) — "이 사람이
+// 볼 수 있는 문서만" — 는 아직 못 한다. documents에 소유 그룹 컬럼이 없어서
+// 저장소 어댑터가 범위 검색을 아예 막아뒀다(adapters/store.ts). 그 컬럼이
+// 생기는 날 이 문 뒤에서 Scope가 사용자 것으로 채워진다(rag/types.ts).
+//
+// 실패를 401로 내려보내는 게 중요하다. 프런트는 이 코드를 보고 "요청이 실패했다"가
+// 아니라 "더 이상 로그인 상태가 아니다"로 읽고 로그인 화면으로 돌아간다(web/api.ts).
+export const requireLogin: RequestHandler = (req, res, next) => {
+  void userFromRequest(req)
+    .then((user) => {
+      if (user) {
+        next();
+        return;
+      }
+      res.status(401).json({ error: "로그인이 필요해요." });
+    })
+    // DB가 죽어서 세션을 못 읽은 것을 "로그인 안 됨"으로 처리하면 안 된다.
+    // 그러면 DB 장애가 전원 강제 로그아웃으로 보이고, 프런트는 멀쩡한 세션을
+    // 버린 채 로그인 화면을 띄운다. 원인이 다르면 코드도 달라야 한다 — 500으로
+    // 올려보내 에러 핸들러가 서버 문제로 기록하게 둔다(index.ts).
+    .catch((e: unknown) => next(e));
+};

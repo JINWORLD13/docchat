@@ -112,6 +112,13 @@ export const llm = createBreaker(THRESHOLD, COOLDOWN_MS);
 // 질문 임베딩. 같은 벤더지만 실패했을 때 할 수 있는 일이 달라서 따로 둔다.
 export const embed = createBreaker(THRESHOLD, COOLDOWN_MS);
 
+// 로컬 생성(Ollama). 클라우드(llm)와 나누는 이유는 역할이 달라서다 —
+// 로컬은 1차 공급자고 뒤에 보루(Gemini)가 있다. 로컬이 "멈춰 있는" 상태
+// (연결은 받는데 응답이 없음)면 요청마다 타임아웃(기본 60초)을 다 기다린 뒤에야
+// 보루로 넘어가는데, 이 회로가 열리면 그 대기 없이 즉시 넘어간다.
+// llm 회로에 합치면 로컬 장애가 보루까지 잠가서 폴백 자체가 무의미해진다.
+export const local = createBreaker(THRESHOLD, COOLDOWN_MS);
+
 // 아래 함수들은 LLM 회로를 가리킨다. 부르는 쪽(routes/chat.ts, index.ts)이
 // 대부분 생성 쪽이라 이름을 짧게 유지한다.
 export const isOpen = (): boolean => llm.isOpen();
@@ -119,9 +126,10 @@ export const onSuccess = (): void => llm.onSuccess();
 export const onFailure = (): void => llm.onFailure();
 export const breakerState = (): BreakerState => llm.state();
 
-// 데모 재실행용. 두 회로를 함께 초기화한다 — 대시보드의 "리셋"은
-// "장애 이전 상태로 돌린다"는 뜻이므로 한쪽만 남으면 안 된다.
+// 데모 재실행용. 회로를 전부 함께 초기화한다 — 대시보드의 "리셋"은
+// "장애 이전 상태로 돌린다"는 뜻이므로 일부만 남으면 안 된다.
 export function reset(): void {
   llm.reset();
   embed.reset();
+  local.reset();
 }

@@ -32,6 +32,12 @@ export function setCached<T>(key: string, value: T): void {
   }
 }
 
+// 지우기. 로그아웃처럼 "캐시가 만료를 기다리면 안 되는" 무효화에 쓴다 —
+// 세션을 DB에서 지웠는데 캐시가 10분간 살아 있으면 그동안은 로그아웃이 거짓말이다.
+export function delCached(key: string): void {
+  cache.del(key);
+}
+
 // 적중률 측정용. { hits, misses, keys, ... }
 export function cacheStats(): NodeCache.Stats {
   return cache.getStats();

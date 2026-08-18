@@ -12,10 +12,10 @@
 interface ChatMessageBase {
   id: string;
   room: string;
-  nickname: string; // 화면에 보이는 이름. 아무나 같은 값을 쓸 수 있다.
-  // 보낸 사람의 공개 신원(realtime/identity.ts). 화면은 이걸로 "내 것"을
-  // 판단하고, 서버는 이걸로 취소 권한을 확인한다. 닉네임과 나눈 이유는
-  // 닉네임이 공개값이라 그대로 흉내낼 수 있었기 때문이다.
+  nickname: string; // 화면에 보이는 이름 (계정의 display_name)
+  // 보낸 사람의 신원 — 이제 계정의 user id다(auth.ts). 화면은 이걸로 "내 것"을
+  // 판단하고, 서버는 이걸로 취소 권한을 확인한다. 이름과 나눈 이유는 그대로다:
+  // 보이는 이름은 흉내낼 수 있지만 로그인 세션은 흉내낼 수 없다.
   authorId: string;
   ts: number; // epoch ms
 }
@@ -48,11 +48,11 @@ export interface RoomSummary {
 }
 
 // 클라이언트 → 서버 (서버가 듣는 이벤트)
+//
+// hello(닉네임 등록)가 없어진 이유: 신원이 소켓 이벤트가 아니라 로그인 세션에서
+// 온다. 연결 자체가 인증이다 — 핸드셰이크의 세션 쿠키로 사용자를 확인하고
+// (gateway.ts의 io.use), 실패하면 연결이 거절된다. 이름도 계정의 것을 쓴다.
 export interface ClientToServer {
-  // 닉네임 등록 → 로비 진입.
-  // clientKey는 브라우저가 만들어 보관하는 비밀값이다(realtime/identity.ts).
-  // 재연결해도 같은 값이라야 자기가 만든 방을 계속 지울 수 있다.
-  hello: (payload: { nickname: string; clientKey?: string }) => void;
   join: (payload: { room: string }) => void; // 방 입장 (없으면 생성) / 방 이동
   leave: () => void; // 방만 나가고 로비로
   deleteRoom: (payload: { room: string }) => void; // 방 삭제 (방장만)
@@ -67,11 +67,9 @@ export interface ClientToServer {
 }
 
 // 서버 → 클라이언트 (서버가 보내는 이벤트)
+// ("me" 이벤트가 없어진 이유: 내 신원은 이제 로그인 응답(/api/auth/me)이
+//  알려준다. 화면은 거기서 받은 user id로 "내 것"을 판단한다.)
 export interface ServerToClient {
-  // 너의 공개 신원은 이거다. hello 직후 그 소켓에만 보낸다.
-  // 화면이 "이 메시지가 내 것인가"를 판단하려면 자기 authorId를 알아야 하는데,
-  // clientKey는 화면에 쓰기엔 위험한 값이라(그대로 권한이다) 공개형을 따로 준다.
-  me: (authorId: string) => void;
   rooms: (rooms: RoomSummary[]) => void; // 방 목록 (바뀔 때마다 전원에게 push)
   history: (messages: ChatMessage[]) => void; // 입장 시 최근 기록
   message: (message: ChatMessage) => void; // 새 메시지 (방 전체에 브로드캐스트)
@@ -83,14 +81,13 @@ export interface ServerToClient {
   chatError: (text: string) => void; // 사용자에게 보여줄 오류 (예: 도배 제한)
 }
 
-// 소켓 하나에 붙여두는 데이터. 아직 입장 전이면 없을 수 있어 optional.
+// 소켓 하나에 붙여두는 데이터.
+// user는 핸드셰이크 미들웨어(gateway.ts의 io.use)가 세션에서 꺼내 채운다.
+// 타입상 optional인 이유는 미들웨어 전에는 비어 있기 때문일 뿐, 연결이
+// 수립된 소켓에는 언제나 있다.
 export interface SocketData {
-  nickname?: string;
+  user?: { id: string; displayName: string };
   room?: string;
-  // 권한 판단의 근거. 절대 다른 소켓으로 나가지 않는다 —
-  // 나가는 건 이걸 HMAC한 authorId뿐이다(identity.ts).
-  clientKey?: string;
-  authorId?: string;
 }
 
 // 대시보드에 노출하는 실시간 채팅 상태.

@@ -1,9 +1,10 @@
-// 질문 임베딩 캐시의 효과를 실제 Gemini API로 잰다.
+// 질문 임베딩 캐시의 효과를 실제 임베딩 API로 잰다.
 // 첫 호출은 캐시에 없어 진짜 임베딩 API를 부르고(미스),
 // 두 번째 호출은 방금 캐싱된 벡터를 그대로 쓴다(히트).
 // 부하가 아니라 단발 측정이라, 무료 티어 rate limit을 건드리지 않는다.
+// (EMBEDDER 스위치를 따라가므로 로컬 임베딩의 캐시 효과도 같은 방법으로 잴 수 있다)
 import "dotenv/config";
-import { embedQuery } from "../gemini.ts";
+import { embedQuery } from "../embedding.ts";
 
 const question = "환불은 며칠 걸려?";
 

@@ -5,6 +5,15 @@
 // 맞다. 다만 지금 단계에서 워크스페이스를 도입하면 빌드 설정만 복잡해지고
 // 얻는 게 적어서, "복사해두고 서로 참조하는 주석을 남기는" 쪽을 택했다.
 
+// --- 계정 ---
+
+export interface Me {
+  id: string;
+  username: string;
+  displayName: string;
+  isGuest: boolean;
+}
+
 // --- 문서 ---
 
 export interface DocumentSummary {
@@ -76,6 +85,8 @@ export interface MetricsResponse {
   // 임베딩 전용 회로. 생성과 나눠 둔 이유는 server/breaker.ts에 있다 —
   // 생성이 죽으면 출처만 돌려줄 수 있지만, 임베딩이 죽으면 검색조차 못 한다.
   embedBreaker: { open: boolean; consecutiveFailures: number; reopensInMs: number };
+  // 로컬 생성(Ollama) 회로. GENERATORS 체인에 ollama가 없으면 늘 닫혀 있다.
+  localBreaker: { open: boolean; consecutiveFailures: number; reopensInMs: number };
   realtime: { rooms: number; users: number; messagesRejected: number };
   faults: { llmFail: boolean };
 }
