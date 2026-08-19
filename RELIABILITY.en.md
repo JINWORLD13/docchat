@@ -240,6 +240,25 @@ Image ids are uuids and the content never changes, so they can carry an immutabl
 cache header, which means only the first request for each image reaches the DB. In
 steady state this pool is nearly empty; it only hits 4 during a flood.
 
+Which pool the session lookup belongs to was the same call. Once every route moved
+behind login (requireLogin), the session lookup became the hottest read in the
+system — it rides on *every* authenticated request — and it was sitting on
+writePool. writePool is where a document upload holds connections while it inserts
+300 chunks inside one transaction, so a single upload could block every user's
+session lookup and stall the whole API. That is exactly what the bulkhead was built
+to prevent, and I had put the hottest read on the writing side of it. Moved to
+readPool. Both pools point at the same DATABASE_URL, so there is no "can't read the
+session I just created" hazard, and a lookup right after issuance is served from
+cache and never reaches the DB at all.
+
+For the same reason the session cache was split off from the question-embedding
+cache. node-cache's maxKeys does not evict the oldest entry when full — it throws
+from set — so sharing one cache means that from the moment enough distinct
+questions fill the ceiling, no new session can be cached and every authenticated
+request goes to the DB: a question flood was a path to breaking login. It also
+splits the metric: /api/metrics' cache hit rate is once again the hit rate of the
+question-embedding cache alone.
+
 Result (R)
 /api/metrics exposes the waiting count for all three pools separately. On the
 dashboard you can watch a write flood pile up waiting on writePool only, while

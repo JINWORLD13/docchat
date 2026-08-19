@@ -9,6 +9,10 @@ import NodeCache from "node-cache";
 // 그때 Redis 같은 공유 캐시로 바꾼다. (Cosmos Tarot 프로젝트가 Redis를 쓰는 이유)
 // 함수 세 개(get/set/stats)만 노출해서, 나중에 Redis 구현으로 교체해도
 // 부르는 쪽(gemini.ts)은 안 바뀌게 했다.
+//
+// 여기에 담기는 건 질문 임베딩뿐이다. 한때 세션도 같이 넣었다가 뺐는데,
+// 이유는 auth.ts의 sessionCache 주석에 적어뒀다 — 한 통을 나눠 쓰면 서로를
+// 굶기고, /api/metrics의 적중률이 무엇의 적중률인지 알 수 없게 된다.
 const cache = new NodeCache({
   stdTTL: 600, // 10분 지나면 만료 (문서가 바뀌면 임베딩도 달라질 수 있어 무한 보관은 안 함)
   maxKeys: 5000, // 메모리 상한. 초과하면 set이 에러를 던지므로 아래에서 삼킴
@@ -30,12 +34,6 @@ export function setCached<T>(key: string, value: T): void {
     // maxKeys 초과 시 던지는 에러는 무시한다. 캐시는 있으면 좋고 없어도 되는 것이라,
     // 캐시가 꽉 찼다고 실제 요청을 실패시키면 안 된다.
   }
-}
-
-// 지우기. 로그아웃처럼 "캐시가 만료를 기다리면 안 되는" 무효화에 쓴다 —
-// 세션을 DB에서 지웠는데 캐시가 10분간 살아 있으면 그동안은 로그아웃이 거짓말이다.
-export function delCached(key: string): void {
-  cache.del(key);
 }
 
 // 적중률 측정용. { hits, misses, keys, ... }

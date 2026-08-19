@@ -11,9 +11,9 @@
 // 한다) — imagetype.ts가 magic bytes를 직접 읽는 것과 같은 판단.
 
 import { randomBytes, randomUUID, scryptSync, timingSafeEqual } from "node:crypto";
+import NodeCache from "node-cache";
 import type { Request, RequestHandler, Response } from "express";
-import { writePool } from "./db.ts";
-import { getCached, setCached, delCached } from "./cache.ts";
+import { readPool, writePool } from "./db.ts";
 
 // --- 비밀번호 ---
 //
@@ -131,9 +131,35 @@ const SESSION_TTL_MS = 30 * 24 * 60 * 60 * 1000; // 30일
 const COOKIE_NAME = "sid";
 
 // 세션 조회는 모든 인증 요청과 소켓 연결마다 일어난다. 매번 DB를 왕복하면
-// 세션 테이블이 서비스 전체의 병목이 되므로 캐시를 앞에 둔다(TTL 10분 —
-// cache.ts). 로그아웃은 delCached로 즉시 무효화하므로 TTL과 무관하게 맞다.
-const cacheKey = (token: string): string => `session:${token}`;
+// 세션 테이블이 서비스 전체의 병목이 되므로 캐시를 앞에 둔다.
+// 로그아웃은 아래 destroySession이 즉시 지우므로 TTL과 무관하게 맞다.
+//
+// 임베딩 캐시(cache.ts)를 같이 쓰다가 따로 뗐다. 이유가 두 가지다.
+//
+// 하나, 서로를 굶긴다. node-cache의 maxKeys는 넘쳤을 때 오래된 걸 밀어내는 게
+// 아니라 set에서 예외를 던지고, 부르는 쪽은 그걸 삼킨다. 한 통을 같이 쓰면
+// 서로 다른 질문이 상한을 채우는 순간부터 새 세션이 캐시에 못 들어가고, 그
+// 뒤로는 인증 요청이 전부 DB로 간다 — 질문 폭주가 로그인을 무너뜨리는 길이
+// 열리는 셈이다. 라우트를 전부 로그인 뒤로 넣으면서 이 경로가 실제로 생겼다.
+//
+// 둘, 지표가 섞인다. /api/metrics의 cache.hitRate는 "질문 임베딩 캐시 적중률"로
+// 문서에 적혀 있고(RELIABILITY.md의 미스 1197ms 대 히트 0.05ms 측정), 대시보드도
+// 그 이름으로 보여준다. 세션 조회는 훨씬 자주 일어나고 거의 항상 적중하므로
+// 같은 통계에 넣으면 적중률이 부풀려져, 그 숫자로 임베딩 캐시를 판단할 수 없다.
+const sessionCache = new NodeCache({
+  stdTTL: 600, // 10분
+  maxKeys: 20_000,
+  checkperiod: 120,
+});
+
+// 캐시가 꽉 차도 요청은 살아야 한다 — 없으면 DB를 한 번 더 볼 뿐이다.
+function cacheSession(token: string, user: SessionUser): void {
+  try {
+    sessionCache.set(token, user);
+  } catch {
+    // maxKeys 초과. 캐시는 있으면 좋고 없어도 되는 것이다(cache.ts와 같은 판단).
+  }
+}
 
 export async function createSession(user: SessionUser): Promise<string> {
   const token = randomBytes(32).toString("hex");
@@ -141,17 +167,26 @@ export async function createSession(user: SessionUser): Promise<string> {
     `insert into sessions (token, user_id, expires_at) values ($1, $2, $3)`,
     [token, user.id, new Date(Date.now() + SESSION_TTL_MS)]
   );
-  setCached(cacheKey(token), user);
+  cacheSession(token, user);
   return token;
 }
 
 export async function sessionUser(token: string): Promise<SessionUser | null> {
   if (!/^[0-9a-f]{64}$/.test(token)) return null; // 모양부터 (uuid 검사와 같은 이유)
 
-  const cached = getCached<SessionUser>(cacheKey(token));
+  const cached = sessionCache.get<SessionUser>(token);
   if (cached) return cached;
 
-  const { rows } = await writePool.query<UserRow>(
+  // 읽기 풀을 쓴다. 쓰기 풀(max 5)은 문서 업로드가 청크 300개를 한 트랜잭션
+  // 안에서 넣는 동안 커넥션을 붙잡는 곳인데, 라우트를 전부 로그인 뒤로 넣은
+  // 뒤로는 세션 조회가 모든 인증 요청에 붙는다. 그대로 두면 업로드 한 번이
+  // 전원의 세션 조회를 막아 API 전체가 멎는다 — Bulkhead를 세워둔 이유가
+  // 정확히 그것인데, 정작 제일 뜨거운 읽기를 쓰기 쪽에 얹고 있던 셈이다.
+  //
+  // 두 풀은 같은 DATABASE_URL을 보므로(db.ts) 방금 만든 세션을 못 읽는
+  // 복제 지연 문제는 없다. 게다가 createSession이 곧바로 캐시에 넣어서,
+  // 발급 직후의 조회는 애초에 DB까지 오지 않는다.
+  const { rows } = await readPool.query<UserRow>(
     `select u.id, u.username, u.display_name, u.is_guest
        from sessions s join users u on u.id = s.user_id
       where s.token = $1 and s.expires_at > now()`,
@@ -161,12 +196,12 @@ export async function sessionUser(token: string): Promise<SessionUser | null> {
   if (!row) return null;
 
   const user = toUser(row);
-  setCached(cacheKey(token), user);
+  cacheSession(token, user);
   return user;
 }
 
 export async function destroySession(token: string): Promise<void> {
-  delCached(cacheKey(token)); // DB보다 먼저 — 지우다 실패해도 캐시는 이미 죽어 있게
+  sessionCache.del(token); // DB보다 먼저 — 지우다 실패해도 캐시는 이미 죽어 있게
   await writePool.query(`delete from sessions where token = $1`, [token]);
 }
 
