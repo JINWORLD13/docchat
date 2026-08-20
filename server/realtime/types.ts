@@ -85,8 +85,14 @@ export interface ServerToClient {
 // user는 핸드셰이크 미들웨어(gateway.ts의 io.use)가 세션에서 꺼내 채운다.
 // 타입상 optional인 이유는 미들웨어 전에는 비어 있기 때문일 뿐, 연결이
 // 수립된 소켓에는 언제나 있다.
+//
+// sessionToken은 로그아웃이 이 소켓을 찾아 끊기 위한 역참조다. 세션이
+// 파기될 때(auth.ts의 onSessionDestroyed) 같은 토큰의 소켓을 끊지 않으면,
+// 채팅 탭은 HTTP 요청을 안 보내므로 401을 만날 일이 없어 로그아웃 뒤에도
+// 그 신원으로 계속 대화가 된다. 서버 안에서만 쓰고 클라이언트로는 안 나간다.
 export interface SocketData {
   user?: { id: string; displayName: string };
+  sessionToken?: string;
   room?: string;
 }
 

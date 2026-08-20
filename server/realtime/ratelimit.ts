@@ -42,8 +42,18 @@ const ACTION_REFILL = Number(process.env.CHAT_ACTION_REFILL || 10);
 // 이게 없으면 위의 IP별 제한을 "연결을 여러 개 여는" 방식으로 곱해버릴 수 있다.
 const MAX_SOCKETS_PER_IP = Number(process.env.CHAT_MAX_SOCKETS_PER_IP || 10);
 
+// 핸드셰이크(연결 시도)용 버킷. 위의 동시 연결 상한과 다른 것을 막는다 —
+// 상한은 "성공한 연결"만 세는데, 인증에 실패하는 시도는 성공하지 못하므로
+// 어떤 한도에도 안 세어진다. 그런데 그 시도 하나하나가 세션 조회(DB일 수
+// 있는)를 태우므로, 시도 자체에 상한이 없으면 지어낸 쿠키의 반복 연결이
+// readPool을 공짜로 두드린다(gateway.ts의 io.use). 정상 재연결은 backoff를
+// 타고 드물게 오므로 초당 1 회복이면 안 걸린다.
+const HANDSHAKE_CAPACITY = Number(process.env.CHAT_HANDSHAKE_CAPACITY || 10);
+const HANDSHAKE_REFILL = Number(process.env.CHAT_HANDSHAKE_REFILL || 1);
+
 const messageBuckets = new TokenBuckets(CAPACITY, REFILL_PER_SEC);
 const actionBuckets = new TokenBuckets(ACTION_CAPACITY, ACTION_REFILL);
+const handshakeBuckets = new TokenBuckets(HANDSHAKE_CAPACITY, HANDSHAKE_REFILL);
 
 // 유휴 버킷 회수. 끊겼다고 지우지 않고, 한동안 아무 활동이 없을 때만 지운다
 // (위 헤더 주석 참고 — 지우는 시점이 곧 우회 지점이었다).
@@ -53,6 +63,7 @@ const IDLE_MS = 10 * 60 * 1000;
 const sweeper = setInterval(() => {
   messageBuckets.sweep(IDLE_MS);
   actionBuckets.sweep(IDLE_MS);
+  handshakeBuckets.sweep(IDLE_MS);
 }, 60 * 1000);
 sweeper.unref();
 
@@ -88,6 +99,11 @@ export function allowAction(ip: string): boolean {
   return actionBuckets.take(ip).ok;
 }
 
+// 인증(세션 조회)보다 먼저 불린다 — 위 handshakeBuckets 주석 참고.
+export function allowHandshake(ip: string): boolean {
+  return handshakeBuckets.take(ip).ok;
+}
+
 export function chatRateLimitStats(): TokenBucketStats {
   return messageBuckets.stats();
 }
@@ -96,5 +112,6 @@ export function chatRateLimitStats(): TokenBucketStats {
 export function reset(): void {
   messageBuckets.reset();
   actionBuckets.reset();
+  handshakeBuckets.reset();
   liveSockets.clear();
 }

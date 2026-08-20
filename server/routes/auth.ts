@@ -22,6 +22,7 @@ import {
 } from "../auth.ts";
 import { TokenBuckets } from "../tokenbucket.ts";
 import { clientIp } from "../clientip.ts";
+import { rateLimit } from "../ratelimit.ts";
 import { randomBytes } from "node:crypto";
 
 const router = Router();
@@ -151,15 +152,23 @@ router.post("/guest", async (req, res) => {
   }
 });
 
-router.post("/logout", async (req, res) => {
+// logout과 me에는 위의 좁은 제한(limited) 대신 질문과 같은 일반 rateLimit을
+// 태운다. 성격이 달라서다 — 이 둘은 비밀번호 추측 자리가 아니라, 인증 없이
+// DB를 두드리게 만들 수 있는 자리다: me는 지어낸 64자리 hex 쿠키마다 세션
+// 조회(readPool)를, logout은 요청마다 DELETE(writePool)를 강제할 수 있었다.
+// index.ts가 rateLimit을 requireLogin 앞에 두는 것과 같은 기준인데, 이 라우터만
+// 그 미들웨어 밖에 있어서 같은 성질의 경로가 제한 없이 열려 있었다.
+// (me를 좁은 쪽에 태우면 새로고침 몇 번에 로그인까지 막힌다 — 예산이 다르다.)
+router.post("/logout", rateLimit, async (req, res) => {
   const token = tokenFromCookieHeader(req.headers.cookie);
+  // 토큰 모양 검사는 destroySession 자신이 한다 — 모양이 아니면 DB에 안 간다.
   if (token) await destroySession(token);
   clearSessionCookie(req, res);
   res.json({ ok: true });
 });
 
 // 화면이 처음 뜰 때 "나 로그인돼 있나"를 묻는 곳.
-router.get("/me", async (req, res) => {
+router.get("/me", rateLimit, async (req, res) => {
   const user = await userFromRequest(req);
   if (!user) {
     res.status(401).json({ error: "로그인이 필요해요." });

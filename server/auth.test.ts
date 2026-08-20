@@ -17,8 +17,10 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import type { Request, Response } from "express";
 import {
+  destroySession,
   DUMMY_PASSWORD_HASH,
   hashPassword,
+  onSessionDestroyed,
   requireLogin,
   tokenFromCookieHeader,
   verifyPassword,
@@ -168,4 +170,23 @@ test("토큰 모양이 아니면 DB까지 가지 않고 막는다", async () => 
     assert.equal(r.passed, false);
     assert.equal(r.error, undefined, "DB에 갔다면 연결 오류가 next로 올라왔을 것이다");
   }
+});
+
+// --- 세션 파기 (destroySession) ---
+
+test("토큰 모양이 아니면 파기도 DB에 가지 않는다 (로그아웃이 공짜 DELETE가 되지 않게)", async () => {
+  // 로그아웃은 로그인 없이 부를 수 있는 경로다. 여기서 안 거르면 요청에 실린
+  // 아무 문자열이나 writePool의 DELETE가 된다.
+  // 이 테스트 환경에는 DB가 없다 — 모양 검사가 빠졌다면 아래 await가 즉시
+  // 돌아오는 대신 커넥션 타임아웃(5초)까지 매달렸다가 reject됐을 것이다.
+  // 즉 통과 자체가 "DB 앞에서 걸러졌다"의 증거다.
+  let notified = 0;
+  onSessionDestroyed(() => notified++);
+
+  await destroySession("아무거나");
+  await destroySession("deadbeef");
+  await destroySession("z".repeat(64));
+
+  // 파기가 일어나지 않았으니 "이 세션의 소켓을 끊으라"는 알림도 없어야 한다.
+  assert.equal(notified, 0);
 });

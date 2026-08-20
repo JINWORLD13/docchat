@@ -12,6 +12,8 @@
 process.env.CHAT_RL_CAPACITY = "5";
 process.env.CHAT_RL_REFILL = "2";
 process.env.CHAT_MAX_SOCKETS_PER_IP = "3";
+process.env.CHAT_HANDSHAKE_CAPACITY = "4";
+process.env.CHAT_HANDSHAKE_REFILL = "1";
 
 import test from "node:test";
 import assert from "node:assert/strict";
@@ -70,6 +72,24 @@ test("IP당 동시 연결 상한을 넘으면 거절한다", () => {
   // 하나 끊으면 다시 한 자리가 난다.
   rl.removeSocket(ip);
   assert.equal(rl.addSocket(ip), true);
+});
+
+test("핸드셰이크 시도에도 상한이 있다 (인증 전 DB 조회를 무제한으로 강제할 수 없게)", () => {
+  rl.reset();
+  const ip = "5.5.5.5";
+
+  for (let i = 0; i < 4; i++) assert.equal(rl.allowHandshake(ip), true);
+  // 여기가 true면 지어낸 쿠키의 반복 연결이 시도마다 세션 조회(DB)를 태운다 —
+  // 동시 연결 상한은 "성공한 연결"만 세므로 실패하는 시도는 거기 안 걸린다.
+  assert.equal(rl.allowHandshake(ip), false, "5번째 시도는 거절");
+});
+
+test("핸드셰이크 버킷도 IP별로 따로다", () => {
+  rl.reset();
+  for (let i = 0; i < 4; i++) rl.allowHandshake("6.6.6.6");
+  assert.equal(rl.allowHandshake("6.6.6.6"), false);
+
+  assert.equal(rl.allowHandshake("7.7.7.7"), true, "남의 시도가 내 연결을 막으면 안 된다");
 });
 
 test("도배로 막힌 수를 집계한다 (대시보드용)", () => {

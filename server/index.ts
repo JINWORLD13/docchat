@@ -177,7 +177,9 @@ app.use("/api/chat", rateLimit, requireLogin, chatRouter);
 // id로 같은 성격의 제한을 건다.
 app.use("/api/kakao", kakaoRouter);
 
-// 계정. 질문용 rateLimit 대신 라우터 안의 전용 제한(비밀번호 추측 방어)을 쓴다.
+// 계정. 질문용 rateLimit 대신 라우터 안에서 경로 성격별로 건다 — 로그인·가입·
+// 게스트는 전용의 좁은 제한(비밀번호 추측 방어), logout·me는 일반 rateLimit
+// (인증 없이 DB를 두드리게 만들 수 있는 자리라 무제한이면 안 된다).
 app.use("/api/auth", authRouter);
 
 // 프런트 빌드 결과물(web/dist)을 같은 오리진에서 서빙한다.

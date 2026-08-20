@@ -37,11 +37,11 @@ import {
   removeMessage,
   imageInUse,
 } from "./rooms.ts";
-import { allowMessage, allowAction, addSocket, removeSocket } from "./ratelimit.ts";
+import { allowMessage, allowAction, allowHandshake, addSocket, removeSocket } from "./ratelimit.ts";
 import { readString } from "./payload.ts";
 import { isAllowedOrigin } from "../origins.ts";
 import { clientIp } from "../clientip.ts";
-import { sessionUser, tokenFromCookieHeader } from "../auth.ts";
+import { onSessionDestroyed, sessionUser, tokenFromCookieHeader } from "../auth.ts";
 
 const MAX_ROOM = 30;
 const MAX_TEXT = 500;
@@ -108,6 +108,17 @@ export function attachRealtime(httpServer: HttpServer): ChatServer {
   // 받아볼 수 있다.
   io.use((socket, next) => {
     void (async () => {
+      // 세션 조회 앞의 제한. 핸드셰이크는 인증 성공 뒤의 IP당 연결 상한
+      // (아래 addSocket)에 안 세어지므로, 여기 제한이 없으면 지어낸 64자리
+      // hex 쿠키로 연결 시도를 반복하는 것만으로 시도당 DB 조회 한 번씩을
+      // 강제할 수 있다 — index.ts가 rateLimit을 requireLogin 앞에 두는 것과
+      // 같은 이유다(싼 검사가 비싼 검사보다 앞).
+      const ip = clientIp(socket.handshake.address, socket.handshake.headers["x-forwarded-for"]);
+      if (!allowHandshake(ip)) {
+        next(new Error("연결 시도가 너무 잦아요. 잠시 후 다시 시도해주세요."));
+        return;
+      }
+
       const token = tokenFromCookieHeader(socket.handshake.headers.cookie);
       const user = token ? await sessionUser(token) : null;
       if (!user) {
@@ -120,6 +131,8 @@ export function attachRealtime(httpServer: HttpServer): ChatServer {
         return;
       }
       socket.data.user = { id: user.id, displayName: user.displayName };
+      // 로그아웃이 이 소켓을 찾을 수 있게 토큰을 붙여둔다(아래 onSessionDestroyed).
+      socket.data.sessionToken = token ?? undefined;
       next();
     })().catch(() =>
       // 여기는 세션 조회 자체가 터진 경우다(DB 장애 등). 표식을 달지 않는다 —
@@ -128,6 +141,24 @@ export function attachRealtime(httpServer: HttpServer): ChatServer {
       // 올려보내는 것과 같은 이유다(auth.ts).
       next(new Error("로그인 확인에 실패했어요."))
     );
+  });
+
+  // 로그아웃(세션 파기)이 그 세션으로 붙어 있던 소켓을 끊는다.
+  //
+  // 연결 인증은 핸드셰이크 한 번뿐이라, 이게 없으면 로그아웃해도 이미 붙은
+  // 소켓은 파기된 신원으로 무기한 대화가 된다 — 채팅 탭은 HTTP 요청을 안
+  // 보내므로 401을 만날 일이 없다. 세션을 DB에 둔 이유가 "공용 PC에서
+  // 로그아웃하면 정말로 로그아웃"(schema.sql)인데, 소켓 경로만 그 보증에서
+  // 빠져 있던 구멍이다. 쿠키를 탈취당한 경우도 같다 — 로그아웃이 탈취자의
+  // 열린 소켓까지 끊어야 세션 파기가 완결된다.
+  //
+  // 전 소켓 순회는 O(연결 수)지만 로그아웃은 드물고 연결은 기껏 수백이라 충분하다.
+  // 30일 자연 만료는 일부러 안 끊는다 — 대화 중에 조용히 끊기는 것보다, 다음
+  // 재연결이 핸드셰이크에서 거절되는 쪽이 낫다.
+  onSessionDestroyed((token) => {
+    for (const [, member] of io.sockets.sockets) {
+      if (member.data.sessionToken === token) member.disconnect(true);
+    }
   });
 
   // 방 목록은 로비에 있는 사람도 봐야 하므로 특정 방이 아니라 전원에게 보낸다.

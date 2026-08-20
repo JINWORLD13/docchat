@@ -130,6 +130,10 @@ export async function findUserByUsername(
 const SESSION_TTL_MS = 30 * 24 * 60 * 60 * 1000; // 30일
 const COOKIE_NAME = "sid";
 
+// 토큰의 올바른 모양(randomBytes(32).toString("hex")). 조회와 파기가 같은 검사를
+// 쓴다 — 모양이 아니면 DB까지 갈 이유가 없다(uuid 검사와 같은 이유).
+const TOKEN_SHAPE = /^[0-9a-f]{64}$/;
+
 // 세션 조회는 모든 인증 요청과 소켓 연결마다 일어난다. 매번 DB를 왕복하면
 // 세션 테이블이 서비스 전체의 병목이 되므로 캐시를 앞에 둔다.
 // 로그아웃은 아래 destroySession이 즉시 지우므로 TTL과 무관하게 맞다.
@@ -152,8 +156,28 @@ const sessionCache = new NodeCache({
   checkperiod: 120,
 });
 
+// 파기 표식(tombstone) — "지웠다"는 사실을 잠깐 기억한다.
+//
+// 없으면 이런 인터리빙이 뚫린다: 요청 R이 DB에서 (아직 유효한) 세션 행을 읽음
+// → 로그아웃이 캐시와 DB에서 세션을 지움 → R이 읽어둔 결과를 캐시에 되넣음.
+// 그 순간부터 파기된 토큰이 캐시 TTL(10분) 동안 모든 인증을 통과한다 — 다른
+// 탭의 요청 하나가 로그아웃과 겹치는 것으로 충분하고, 쿠키를 탈취한 쪽은
+// 요청을 계속 흘려 이 레이스를 의도적으로 이길 수 있다. "로그아웃은
+// destroySession이 즉시 지우므로 맞다"는 위 보증이 정확히 여기서 깨진다.
+//
+// 표식의 수명은 "파기 시점에 진행 중이던 조회가 끝날 때까지"면 충분하지만
+// (밀리초 단위), 여유 있게 캐시 TTL과 맞춘다. 상한을 넘치면(10분에 로그아웃
+// 2만 건 — 사실상 공격) 표식을 못 남기는 대신 캐시를 통째로 비운다 —
+// 정확성이 캐시 적중률보다 먼저다.
+const destroyedTokens = new NodeCache({
+  stdTTL: 600,
+  maxKeys: 20_000,
+  checkperiod: 120,
+});
+
 // 캐시가 꽉 차도 요청은 살아야 한다 — 없으면 DB를 한 번 더 볼 뿐이다.
 function cacheSession(token: string, user: SessionUser): void {
+  if (destroyedTokens.has(token)) return; // 파기와 겹친 조회의 되넣기를 막는다
   try {
     sessionCache.set(token, user);
   } catch {
@@ -172,7 +196,7 @@ export async function createSession(user: SessionUser): Promise<string> {
 }
 
 export async function sessionUser(token: string): Promise<SessionUser | null> {
-  if (!/^[0-9a-f]{64}$/.test(token)) return null; // 모양부터 (uuid 검사와 같은 이유)
+  if (!TOKEN_SHAPE.test(token)) return null; // 모양부터
 
   const cached = sessionCache.get<SessionUser>(token);
   if (cached) return cached;
@@ -200,8 +224,34 @@ export async function sessionUser(token: string): Promise<SessionUser | null> {
   return user;
 }
 
+// 세션이 파기될 때 알아야 하는 곳이 등록하는 훅. 실시간 게이트웨이가 쓴다 —
+// 로그아웃은 HTTP에서 일어나지만 끊어야 할 연결은 소켓에 있고, 이 파일이
+// socket.io를 알면 계층이 거꾸로 선다(auth는 저수준, gateway가 auth를 쓴다).
+type SessionDestroyedListener = (token: string) => void;
+const sessionDestroyedListeners: SessionDestroyedListener[] = [];
+export function onSessionDestroyed(listener: SessionDestroyedListener): void {
+  sessionDestroyedListeners.push(listener);
+}
+
 export async function destroySession(token: string): Promise<void> {
-  sessionCache.del(token); // DB보다 먼저 — 지우다 실패해도 캐시는 이미 죽어 있게
+  // 모양이 아니면 우리가 발급한 토큰일 수 없다. 여기서 안 거르면 로그아웃
+  // 요청에 실린 아무 문자열이나 writePool(max 5)의 DELETE가 된다 — 로그인도
+  // 안 된 요청이 업로드·로그인과 같은 풀을 쓰게 두는 셈이다.
+  if (!TOKEN_SHAPE.test(token)) return;
+
+  // 표식 먼저, 삭제는 다음. 순서가 반대면 "캐시에서 지웠는데 진행 중이던
+  // 조회가 되넣는" 틈이 표식 전에 생긴다(위 destroyedTokens 주석).
+  try {
+    destroyedTokens.set(token, true);
+  } catch {
+    sessionCache.flushAll(); // 표식을 못 남기면 통째로 비운다 — 정확성 우선
+  }
+  sessionCache.del(token);
+
+  // DB 삭제 전에 알린다 — DB가 순간 흔들려도 이 세션의 소켓은 끊어야
+  // "로그아웃했는데 채팅은 계속 된다"가 안 된다. 실패하면 만료 정리가 걷어간다.
+  for (const listener of sessionDestroyedListeners) listener(token);
+
   await writePool.query(`delete from sessions where token = $1`, [token]);
 }
 
