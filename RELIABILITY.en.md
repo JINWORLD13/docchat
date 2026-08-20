@@ -1,4 +1,4 @@
-[한국어](RELIABILITY.md) | [日本語](RELIABILITY.ja.md) | **English**
+[한국어](RELIABILITY.md) | [日本語](RELIABILITY.ja.md) | English
 
 # DocChat — Load and failure handling design
 
@@ -161,12 +161,12 @@ doesn't give the budget back"). Live socket counts are still tracked, but now
 they're used only for the concurrent-connection cap per IP.
 
 Two rules came out of this.
-**Key on something the attacker can't change, and give the limit a longer life than
-the connection.** Knowing that a connection ended doesn't mean you get to forget
+Key on something the attacker can't change, and give the limit a longer life than
+the connection. Knowing that a connection ended doesn't mean you get to forget
 "the budget this person spent." A termination signal is a valid basis for deciding
 *when* to reclaim, and an invalid basis for erasing a limit. And one more —
-**behavior that the docs say is "blocked" quietly comes undone unless a test pins
-it.** This item had come undone in exactly that way.
+behavior that the docs say is "blocked" quietly comes undone unless a test pins
+it. This item had come undone in exactly that way.
 
 For the same reason there's a cap (10 by default) on concurrent sockets per IP.
 Without it you can multiply the per-IP limit just by opening more connections.
@@ -203,7 +203,7 @@ What I decided and why (A)
   short queue and defend against sustained overload by rejecting. I took this
   compromise.
 
-And I added one more thing — a limit on the **time** in the queue.
+And I added one more thing — a limit on the time in the queue.
 At first I limited only the queue length, and then realized that alone doesn't let
 me claim I'd eliminated unbounded waiting. Even with 20 slots, if the requests
 ahead get slow the ones behind wait arbitrarily long. The length is finite while
@@ -212,9 +212,9 @@ no slot opens within it the request gives up waiting and goes back with a 429. B
 then the user has left anyway, and processing it late just spends resources on a
 response nobody will collect.
 
-That's why I observe two kinds of rejection separately. Bounced **immediately**
+That's why I observe two kinds of rejection separately. Bounced immediately
 because the queue was full (`rejected`) is a signal that overload is sustained;
-giving up at the **deadline** after waiting (`timedOut`) is a signal that processing
+giving up at the deadline after waiting (`timedOut`) is a signal that processing
 itself got slower. Different causes, so different responses.
 
 Result (R) — 50 concurrent connections, before/after
@@ -292,7 +292,7 @@ readPool stays at 0.
 
 File: server/breaker.ts
 
-First, the hole this layer had. The circuit was on **generation (the LLM) only**.
+First, the hole this layer had. The circuit was on generation (the LLM) only.
 But the question path goes out to the network in two places — the embedding that
 turns the question into a vector, and the generation that produces the answer. The
 embedding call sat outside the circuit (ahead of the `isOpen()` check), so when the
@@ -472,8 +472,8 @@ pinned by unit tests.
 | rag/boundary.test.ts | 3 | That the core (rag/) imports no express, pg, or genai — testing the boundary itself |
 
 The last three files listed here (clientip, origins, realtime/ratelimit) were added
-later, and for the same reason — all three are places where **behavior this document
-recorded as "blocked" had actually come undone.** After confirming three times that
+later, and for the same reason — all three are places where behavior this document
+recorded as "blocked" had actually come undone. After confirming three times that
 a claim left as prose quietly disappears in the next commit, I moved my standard to
 attaching a test to every behavior I claim.
 
@@ -487,7 +487,7 @@ were destructuring their arguments inline (`socket.on("message", ({ text }) => .
 By the types, `{ text: string }` is what arrives, but that's a compile-time promise
 and the value coming down the wire can be anything. When `null` arrives, the
 destructuring throws a TypeError right there, and since Socket.IO calls listeners
-without a try/catch it becomes an uncaughtException and **the whole process dies**.
+without a try/catch it becomes an uncaughtException and the whole process dies.
 One line of `socket.emit("message")` in a browser console disconnected everyone.
 hello, join, and image were the same. What this test protects is availability, not
 convenience.
@@ -598,16 +598,16 @@ The same principle applies outside authentication. Set `trust proxy` to `true`
 a different value on every request, and the Rate Limiter that buckets by IP
 (section 2) sees "a new user every time" and is bypassed entirely. So the code
 default is `0` (trust nothing), and only when it sits behind a load balancer do you
-give `TRUST_PROXY` a hop count — that's what I'd written, while **the deploy config
-(render.yaml) had no such value in it and the live demo was running that way.**
+give `TRUST_PROXY` a hop count — that's what I'd written, while the deploy config
+(render.yaml) had no such value in it and the live demo was running that way.
 
 The result was a failure in the opposite direction. Render terminates TLS at the
 edge and passes plaintext to our server, so with 0 trusted hops every visitor's
 `req.ip` collapses into that one proxy address. "Per-IP limiting" became "one shared
 global limit" — one visitor asking a few questions empties the bucket (capacity 10)
 and other visitors get 429s, and because of the concurrent-socket cap per IP (10 by
-default), **the 11th visitor anywhere in the world had their chat connection
-rejected.**
+default), the 11th visitor anywhere in the world had their chat connection
+rejected.
 
 And filling in the environment variable didn't fix the socket. `trust proxy` is an
 Express setting, so it applies only to `req.ip`, while `socket.handshake.address` is
@@ -617,9 +617,9 @@ proxy-addr) into `server/clientip.ts` as a pure function, so the socket side dec
 the IP by the same standard, and pinned what happens when you count hops wrong with
 8 tests.
 
-The lesson of this item is at the boundary, not in the code — **configuration goes
+The lesson of this item is at the boundary, not in the code — configuration goes
 wrong more quietly than code does, and one framework's setting doesn't protect the
-framework next to it.**
+framework next to it.
 
 ### The socket origin was the same kind of thing
 

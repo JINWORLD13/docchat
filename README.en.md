@@ -1,10 +1,10 @@
-[한국어](README.md) | [日本語](README.ja.md) | **English**
+[한국어](README.md) | [日本語](README.ja.md) | English
 
 # DocChat
 
 [![CI](https://github.com/JINWORLD13/docchat/actions/workflows/ci.yml/badge.svg)](https://github.com/JINWORLD13/docchat/actions/workflows/ci.yml)
 
-**[Live demo →](https://docchat-izxf.onrender.com)** (Render free tier, so the server
+[Live demo →](https://docchat-izxf.onrender.com) (Render free tier, so the server
 sleeps after a while with no traffic and the first request can take up to a minute
 to wake it.)
 
@@ -130,7 +130,13 @@ myself. I didn't guess at the bottleneck; I put load on it and measured (it was 
 DB pool, not the LLM), and pinned each layer's behavior with unit tests.
 (`cd server && npm test` — 147 of them)
 
-The reasoning, the alternatives I compared, and the numbers are in
+Measured per measure (50 concurrent connections, LLM mocked out): admission
+control cut the pool queue 88 → 6; an open circuit cut mid-outage latency
+500 → 190 ms with zero hard errors; the embedding cache turned a 1197 ms miss
+into a 0.05 ms hit; moving log writes off the response path cut p99
+2794 → 1606 ms (-42%).
+
+The reasoning, the alternatives I compared, and the measurement method are in
 [RELIABILITY.en.md](RELIABILITY.en.md).
 
 ### Real-time chat
@@ -147,7 +153,7 @@ history behind them the room disappears from the list. Leaving empty rooms aroun
 means every name anyone ever used piles up forever, and there's nobody here to
 clean that up, so I went with the version that cleans itself.
 
-**I separated the visible name from what authorization is based on.** Deleting a
+I separated the visible name from what authorization is based on. Deleting a
 room and "unsend" are irreversible (if what you unsend is an image, the bytes go
 out of the DB too), and at first I based that permission on the nickname. Nicknames
 are fully public — in the bubbles, the connected-user list, the room list — and
@@ -179,24 +185,24 @@ messages blocked as flooding.
 Three ways to send an image: file picker, paste (screenshots), and drag and drop.
 Images are stored in Postgres as `bytea`.
 
-**Bytes don't go over the socket.** They're uploaded over HTTP first, and only the
+Bytes don't go over the socket. They're uploaded over HTTP first, and only the
 id rides the socket. Put them on the socket and one photo gets copied once per
 person in the room, and the last-50-messages history held in memory fills up with
 whole images too.
 
-**The server makes the URL.** The upload returns an id, not a URL. If the client
+The server makes the URL. The upload returns an id, not a URL. If the client
 could choose the URL, it could spray something like
 `https://evil.example.com/tracker.gif` across the whole room and make everyone's
 browser send a request to somebody else's server. The server checks that the id it
 received is one it issued before it attaches a URL.
 
-**Format comes from the leading bytes.** Filename and Content-Type are both values
+Format comes from the leading bytes. Filename and Content-Type are both values
 the client writes, so I don't trust them. I check the fixed signatures of
-png/jpg/gif/webp myself, and **I deliberately left SVG out** — SVG is XML, so it
+png/jpg/gif/webp myself, and I deliberately left SVG out — SVG is XML, so it
 can contain `<script>`, and the moment it's served from the same origin it's stored
 XSS. Responses also carry `X-Content-Type-Options: nosniff`.
 
-**Fetching is isolated in its own connection pool.** Image fetches are frequent,
+Fetching is isolated in its own connection pool. Image fetches are frequent,
 heavy reads that fire every time a message renders, so putting them on the
 question-retrieval read pool lets one photo-heavy room starve the exact path this
 project said it would defend. Since ids are uuids and the content never changes, I
@@ -210,15 +216,15 @@ chat — the ＋ button, paste (screenshots), and drag and drop (multimodal
 generation). Storage and the upload path are shared with the real-time chat —
 upload over HTTP first, and only the id rides with the question.
 
-**GIF is blocked only for questions.** The upload path is shared with chat, so gif
+GIF is blocked only for questions. The upload path is shared with chat, so gif
 passes there, but Gemini's image understanding doesn't support gif. Skip the
 filter here and the upload succeeds cleanly while only the question blows up with
 a 500 — and on top of that, a user's mistake piles up as failures on the LLM
 circuit breaker. A few people uploading gifs would open the circuit and degrade
 perfectly good questions: a circuit that opens on somebody else's fault.
 
-**For how this relates to the refusal gate, see "Making it say it doesn't know"
-above** — with an image attached, the evidence is the image, so there's no
+For how this relates to the refusal gate, see "Making it say it doesn't know"
+above — with an image attached, the evidence is the image, so there's no
 similarity refusal.
 
 ### The generator is a chain — local first, cloud as the last resort
@@ -230,7 +236,7 @@ in exactly one place, `server/composition.ts` — let each transport (web SSE,
 Kakao) assemble its own and you get two quietly diverging systems, like "the web
 is local-first but Kakao is Gemini-only."
 
-**The switching boundary is "before the first chunk."** Switch to another model
+The switching boundary is "before the first chunk." Switch to another model
 after tokens have already flowed onto the screen and you splice on an answer whose
 opening repeats and whose style has changed. At that point it doesn't fall back —
 it degrades (keep the sources, give up only the generation). There's also a
@@ -250,7 +256,7 @@ OpenBuilder skill webhook (`/api/kakao/skill/<token>`). Retrieval, refusal, and
 degrade policy are all decided by the core, so a question the web would refuse is
 refused in KakaoTalk with the same wording.
 
-**The decisive difference from the web is *when to send*.** SSE can just let
+The decisive difference from the web is *when to send*. SSE can just let
 chunks flow, but OpenBuilder demands one complete JSON within 5 seconds and has no
 streaming. So the event stream is collected inside a time budget (3.5 seconds by
 default — leaving a share for the network back to Kakao); finish inside the budget

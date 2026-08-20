@@ -1,4 +1,4 @@
-[한국어](PORTFOLIO.md) | [日本語](PORTFOLIO.ja.md) | **English**
+[한국어](PORTFOLIO.md) | [日本語](PORTFOLIO.ja.md) | English
 
 # DocChat
 
@@ -35,7 +35,7 @@ Input and output tokens are recorded too, so cost is tracked.
 ![Refusing when the document doesn't cover it](docs/demo-refusal.png)
 
 If the top similarity from retrieval falls below the threshold (0.62), it refuses.
-The LLM is **not even called** — that blocks the nonsense and saves tokens and
+The LLM is not even called — that blocks the nonsense and saves tokens and
 latency at the same time. (There's one exception, a question with an image
 attached — upload a screenshot and ask "what's this error" and the evidence is
 inside the image, not the text, so it doesn't refuse on text similarity and
@@ -81,7 +81,7 @@ limit.
 
 Inject an LLM outage and consecutive failures accumulate until the Circuit Breaker
 opens (red); after that, requests respond degraded (sources only) without calling
-the LLM. **0 hard errors out of 20** — the user loses only the summarized answer
+the LLM. 0 hard errors out of 20 — the user loses only the summarized answer
 and still gets the relevant documents.
 
 The reasoning and the measurements are in [RELIABILITY.en.md](RELIABILITY.en.md).
@@ -245,8 +245,8 @@ the bypass intact. Measured over the same wall-clock time with the same volume: 
 messages went out on a held connection while 20 went out by disconnecting and
 reconnecting.
 
-Two rules came out of it. **Key on something the attacker can't change, and make
-the limit outlive the connection.** Knowing a connection ended doesn't entitle you
+Two rules came out of it. Key on something the attacker can't change, and make
+the limit outlive the connection. Knowing a connection ended doesn't entitle you
 to forget the budget that person spent — the disconnect signal is a fine reason to
 schedule reclamation and the wrong reason to erase a limit. So reclamation moved to
 the same idle `sweep()` the HTTP side uses, and the behavior ("disconnecting and
@@ -355,8 +355,8 @@ async function withRetry<T>(fn: () => Promise<T>, label: string): Promise<T> {
 
 This is the biggest thing I learned on this project. Every time I built a defense
 layer I wrote down in the docs what it blocked, and when I later went back and
-actually attacked those claims one by one, **four of them weren't blocking
-anything.** That's a worse state than the code being wrong — I'd written down that
+actually attacked those claims one by one, four of them weren't blocking
+anything. That's a worse state than the code being wrong — I'd written down that
 the wrong thing was right.
 
 | What the docs claimed | Reality | Why they diverged |
@@ -366,8 +366,8 @@ the wrong thing was right.
 | "the reconnect bypass is closed" | Disconnect and reconnect and the budget resets | I fixed the key, but the reclamation code brought the bypass back |
 | "closing the tab aborts generation" | Upstream generates to the end (and bills for it) | Breaking out of `for await` doesn't close an HTTP response that's already open |
 
-The pattern is visible. All four diverged **not inside logic I wrote, but at the
-boundary where that logic meets something else** — a framework setting, a library's
+The pattern is visible. All four diverged not inside logic I wrote, but at the
+boundary where that logic meets something else — a framework setting, a library's
 default behavior, the deploy environment, an SDK's cancellation contract. Tests were
 guarding the logic. Nobody was watching the boundaries.
 
@@ -391,7 +391,7 @@ destructive operations. Nicknames are fully public in the bubbles, the connected
 list, and the room list; message ids are broadcast to the whole room; and nickname
 registration can be re-sent at any time. Writing down someone else's name and
 sending it let you delete their room and erase a photo they uploaded from everyone,
-**down to the bytes in the DB**. No way back.
+down to the bytes in the DB. No way back.
 
 First I stopped using one value as both "the name shown" and "the basis for
 permission" (an authorId: a secret the browser keeps, HMAC'd on the server). Then I
@@ -409,7 +409,7 @@ changes on every reconnect, so one page refresh and you can't delete your own ro
 For the socket, connecting *is* the authentication: the handshake's session cookie
 identifies the user, and the connection is refused if it fails. Moving identity from
 "this tab" up to an account means you're the same person on another device too, and
-the principle is unchanged: **don't authorize on a value that's published.**
+the principle is unchanged: don't authorize on a value that's published.
 
 The question, document, and image APIs went behind that same session. There are
 two exceptions. `/api/metrics` is left open because it carries only aggregate
@@ -441,7 +441,29 @@ Token usage (per question)
 Retrieval quality
 
 Related and unrelated questions separated cleanly, 0.66–0.74 against 0.53–0.59.
-That gap is the evidence that the refusal gate actually works.
+That gap is the evidence that the refusal gate actually works. The gate is a cost
+control as much as a quality control — an unrelated question skips the LLM
+entirely, so 3–8 s becomes 0.5 s and roughly 900 input tokens per question are
+never spent.
+
+Load and failure handling, measured (summary)
+
+The design rationale and full numbers live in [RELIABILITY.en.md](RELIABILITY.en.md);
+the per-measure before/after boils down to this. Environment: 50 concurrent
+connections, the external LLM mocked out (measuring only the server layers I
+control), DB on cloud Postgres (Neon) — read these for direction and magnitude,
+not absolute values.
+
+| Measure | Before | After |
+|---|---|---|
+| Bottleneck measurement (baseline) | mean latency 1788 ms · pool queue 88 | confirmed the bottleneck was the DB pool, not the LLM |
+| Admission control | queue depth 88 and climbing | 6, overflow rejected instantly with 429 + Retry-After |
+| Circuit breaker (9 injected failures) | ~500 ms hanging per request | ~190 ms fast degrade once open, zero hard errors |
+| Question-embedding cache | miss 1197 ms | hit 0.05 ms |
+| Log writes off the response path | p99 2794 ms · 20 RPS | p99 1606 ms (-42%) · 24 RPS |
+| Rate limiter (capacity 10, refill 5/s) | 15 simultaneous requests all attempted | 10 pass · 5 get 429 |
+| Reconnect-bypass fix | 20 messages through by reconnecting | same 9 as a persistent connection (budget outlives the connection) |
+| multer fields/parts caps | one request pushed memory 130 → 300 MB | rejected immediately with 400 |
 
 Tests
 
