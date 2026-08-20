@@ -7,11 +7,12 @@ It refuses questions the documents don't cover instead of inventing an answer, a
 shows the sources behind every answer. A real-time chat where several people talk
 in the same room sits on the same server.
 
-- Period: 2026.06 ~ 2026.07
+- Period: 2026.06 ~ 2026.08
 - Team: solo (design · development · testing · documentation)
 - Repository: https://github.com/JINWORLD13/docchat
 - Stack: TypeScript · React (Vite) · Node/Express · PostgreSQL + pgvector ·
-  Socket.IO · Gemini API · Docker
+  Socket.IO · Gemini API · Ollama (optional — local LLM chain) · Docker
+- Channels: web (SSE) · KakaoTalk OpenBuilder skill (webhook)
 - Local run: the three steps under [Running](#running)
 
 ---
@@ -35,17 +36,20 @@ Input and output tokens are recorded too, so cost is tracked.
 
 If the top similarity from retrieval falls below the threshold (0.62), it refuses.
 The LLM is **not even called** — that blocks the nonsense and saves tokens and
-latency at the same time.
+latency at the same time. (There's one exception, a question with an image
+attached — upload a screenshot and ask "what's this error" and the evidence is
+inside the image, not the text, so it doesn't refuse on text similarity and
+answers from the image alone. The evidence moves from the documents to the image.)
 
 ### Real-time chat running on the same server
 
 ![Real-time chat](docs/demo-chat.png)
 
-Pick a nickname and you can create or choose a room from the lobby. Headcounts in
-the room list, connected users, join notices, and the indicator that someone else
-is typing all travel over a single socket. Rooms vanish when they empty out —
-there's no way to leave an empty room in the list, which is why creating a room and
-joining one are the same action.
+Log in (a guest just picks a nickname and is straight in) and you can create or
+choose a room from the lobby. Headcounts in the room list, connected users, join
+notices, and the indicator that someone else is typing all travel over a single
+socket. Rooms vanish when they empty out — there's no way to leave an empty room
+in the list, which is why creating a room and joining one are the same action.
 
 Answer tokens are SSE (one-way) and chat is WebSocket (two-way, 1:N), so they're
 different in nature, but there's only one process. Why I didn't split them is under
@@ -87,9 +91,10 @@ The reasoning and the measurements are in [RELIABILITY.en.md](RELIABILITY.en.md)
 ## Architecture
 
 ```
-  Browser (React)
-     │  question (POST, answer over SSE) · chat (WebSocket) · image (POST → id)
-     ▼
+  Browser (React, session-cookie login)       KakaoTalk (OpenBuilder skill webhook)
+     │  question (POST, answer over SSE)          │  question (JSON — complete answer
+     │  chat (WebSocket) · image (POST → id)      │        in 5s, or callback/partial)
+     ▼                                            ▼
   Express server + Socket.IO  (one process · same port 4000)
      │
      ├─ chat: socket → flood limit (Token Bucket) → broadcast to the room
@@ -106,11 +111,14 @@ The reasoning and the measurements are in [RELIABILITY.en.md](RELIABILITY.en.md)
      └─ ask: question → embedding → vector search top5
                                 │
                                 ├─ similarity < 0.62 → refuse (no LLM call)
+                                │   (image-attached questions excepted — the evidence is the image)
                                 │
                                 └─ passes → excerpts into the prompt, generate
                                               │
                                               ▼
-                                     Gemini API (generation, streaming)
+                                     generator chain (streaming)
+                                     Gemini by default — with GENERATORS=ollama,gemini,
+                                     local (Ollama) first, Gemini as the last resort on failure
 ```
 
 The document Q&A is two flows. The ingest flow (chunk → embed → store) and the
@@ -118,6 +126,12 @@ question flow (retrieve → decide whether to refuse → generate). The generati
 is just the last piece; the retrieval and the refusal in front of it are the body of
 this project. Chat differs only in transport, rides in the same process, and shares
 defense logic like rate limiting with the document Q&A.
+
+With two transports (web SSE and Kakao), engine assembly happens in exactly one
+place, `server/composition.ts` — let each transport assemble its own engine and
+you get two quietly diverging systems, like "the web is local-first but Kakao is
+Gemini-only." Retrieval, refusal, and degrade policy all live in the core, so a
+question the web would refuse is refused in KakaoTalk with the same wording.
 
 ---
 
@@ -148,14 +162,45 @@ reconnection come free. Chat is bidirectional and has to push one person's messa
 to the whole room (1:N), so WebSocket is the right fit. The transport wasn't a
 matter of taste; the direction the data needed to go decided it.
 
+Generation is a chain; embedding is a switch.
+Write the generators as `GENERATORS=ollama,gemini` and it tries from the front,
+moving on to the next on failure — on-device first, cloud as the last resort, and
+that configuration is one env line. The switching boundary is nailed at "before
+the first chunk." Switching to another model after tokens have already flowed onto
+the screen splices on an answer whose opening repeats and whose style has changed,
+so at that point it doesn't fall back — it degrades (keep the sources, give up
+only the generation). There's a dedicated local circuit breaker too — when Ollama
+is dead, instead of waiting out the timeout every time, it goes straight to the
+last resort.
+Embedding, by contrast, is a fixed switch (`EMBEDDER`), not a chain. Documents and
+the question must be embedded by the same model for retrieval to hold (similarity
+across different vector spaces is meaningless), so fallback is structurally
+impossible, and switching means re-uploading the documents.
+
+KakaoTalk is a question of *when to send*.
+An OpenBuilder skill demands one complete JSON within 5 seconds and has no
+streaming. So the adapter's job is to collect the event stream inside a time
+budget (3.5 seconds by default — leaving a share for the network back to Kakao):
+finish inside the budget and it's a complete answer; miss it and it hands off to a
+callback (an asynchronous reply), and with no callback available it at least
+delivers a partial answer. The rate limit is keyed on the Kakao user id, not the
+IP — every request arrives from Kakao's server IPs, so a per-IP limit becomes one
+shared global limit. OpenBuilder has no request signing, so a secret token in the
+skill URL verifies it instead. The budget collector is a pure function that knows
+nothing about express, so it's tested with fake events alone (11 in kakao.test.ts).
+
 Even so, I didn't split the server.
 "The transports differ" and "there's a reason to split the process" are different
 statements. Socket.IO is attached to the same Express HTTP server, keeping port,
 deployment, and CORS as one thing, and the defense logic is shared. Only after
 merging did the duplication show up — the HTTP request limit and the chat flood
 limit each had their own copy of the same Token Bucket. I pulled it out into
-server/tokenbucket.ts, had both share it, and gave them different values (HTTP is
-capacity 10, refill 5 per second; chat is 5 and 2).
+server/tokenbucket.ts, shared it, and gave each use its own values. Today eight
+uses run on the same class — HTTP questions and documents (capacity 10, refill 5
+per second), chat messages (5·2), chat actions (join·typing, 20·10), the socket
+handshake (10·1), image upload (5·0.5) and fetch (120·20), login/sign-up
+(10·0.17, password-guessing defense), and the Kakao skill (5·0.5, keyed on the
+Kakao user id rather than the IP).
 
 The rule behind those numbers isn't "how expensive is the request" but "how far does
 the damage spread when it overflows." By cost alone the HTTP question path is far
@@ -291,13 +336,14 @@ errors that retrying can't fix, like 400 and 404.
 ```ts
 const RETRYABLE = new Set([429, 500, 503, 504]);
 
-async function withRetry<T>(fn: () => Promise<T>): Promise<T> {
+async function withRetry<T>(fn: () => Promise<T>, label: string): Promise<T> {
   const delays = [500, 1000, 2000];        // 0.5s → 1s → 2s
   for (let attempt = 0; ; attempt++) {
     try { return await fn(); }
     catch (e) {
+      const status = e instanceof Error ? statusOf(e) : undefined;
       const wait = delays[attempt];        // undefined = retries are used up
-      if (!RETRYABLE.has(statusOf(e)) || wait === undefined) throw e;
+      if (status === undefined || !RETRYABLE.has(status) || wait === undefined) throw e;
       // jitter: scatter requests that failed together so they don't all come back at once
       await new Promise((r) => setTimeout(r, wait / 2 + Math.random() * wait));
     }
@@ -365,9 +411,12 @@ identifies the user, and the connection is refused if it fails. Moving identity 
 "this tab" up to an account means you're the same person on another device too, and
 the principle is unchanged: **don't authorize on a value that's published.**
 
-The question, document, and image APIs went behind that same session. `/api/metrics`
-is left open — it carries only aggregate counters, and the place you'd diagnose a
-"nobody can log in" outage from must not itself sit behind login.
+The question, document, and image APIs went behind that same session. There are
+two exceptions. `/api/metrics` is left open because it carries only aggregate
+counters and the place you'd diagnose a "nobody can log in" outage from must not
+itself sit behind login; `/api/kakao/skill` is called by the Kakao server, not a
+browser, so there can be no session — a token embedded in the skill URL verifies
+it instead.
 
 ---
 
@@ -396,22 +445,28 @@ That gap is the evidence that the refusal gate actually works.
 
 Tests
 
-109 unit tests passing (`npm test`). Focused on pure logic that runs with no external
+147 unit tests passing (`npm test`). Focused on pure logic that runs with no external
 dependencies.
 
 | Target | Count | What it verifies |
 |---|---|---|
+| RAG core (question → events) | 13 | Refusal, sources-first delivery, degrade, logging — verified with fake ports plugged in, no DB or API |
+| Core boundary | 3 | That the core (rag/) imports no express, pg, or genai |
 | Chunking | 3 | Short text is 1 chunk, long text splits with overlap, the overlapping region matches |
 | Rate Limiter | 4 | Capacity passes, the excess gets 429, per-IP isolation, tokens refill over time |
 | Token Bucket | 8 | Bursts allowed, excess rejected, retry-after reported, refill cap, per-key isolation, drop and sweep reclamation |
 | Circuit Breaker | 9 | Opens at the threshold, counter resets on success, recovers after cooldown, only one trial request while half-open |
+| Generator fallback chain | 6 | When the circuit counts success (only once the stream is consumed to the end), fallback boundary is "before the first chunk" only |
 | Admission Control | 6 | Passes up to the cap, yields to the queue, immediate rejection when the queue is full, wait deadline |
+| Accounts & sessions | 11 | Password verification returns true/false on any input without throwing, dummy hash shape, cookie parsing, the login gate (401), destroy shape checks |
 | Chat room management | 31 | Removed from the list on leave (no ghost users), empty rooms cleaned up (no memory leak), history capped at 50, rooms isolated, no unbounded room growth, same nickname still can't delete someone else's, a message to a nonexistent room doesn't resurrect it |
 | Socket payload defense | 6 | Handlers survive payloads that arrive as null, a number, or an empty object |
 | Upload format detection | 8 | png/jpg/gif/webp identified from the leading bytes, extension decided by content and not filename, SVG and HTML disguises rejected, doesn't blow up on empty or truncated files |
 | Client IP decision | 8 | Picking the real IP behind a proxy — with 0 hops everyone collapses into one IP, with too many the header is trusted and gets bypassed |
 | Origin decision | 8 | Other sites blocked, same origin (our own screen, deployed together) allowed, suffix spoofing rejected |
-| Socket flood limit | 5 | Budget doesn't come back after disconnect and reconnect, cap on concurrent connections per IP |
+| Socket flood limit | 7 | Budget doesn't come back after disconnect and reconnect, cap on concurrent connections per IP, cap on handshake attempts |
+| Kakao adapter | 11 | Skill payload shape checks, time-budget collection (complete/partial), response assembly — with fake events alone |
+| Ollama adapter | 5 | Parsing the local generation stream, distinguishing errors |
 
 The defense layers are this project's central claim, so the claimed behavior is
 pinned by tests. Token Bucket takes the clock as an argument (`take(key, now)`), so
@@ -434,8 +489,11 @@ The refusal gate — this project's identity (server/rag/engine.ts)
 
 ```ts
 const topSimilarity = chunks[0]?.similarity ?? 0;
+const relevant = chunks.length > 0 && topSimilarity >= policy.threshold;
 
-if (chunks.length === 0 || topSimilarity < policy.threshold) {
+// With an image attached, don't refuse — the evidence moves from the documents to the image.
+// (And don't slip irrelevant excerpts in either: contexts = relevant ? chunks : [])
+if (!relevant && !image) {
   yield { type: "refusal", message: messages.refusal };
   log({ question, refused: true, topSimilarity, /* ... */ });
   return;             // it ends here — the generator is never called
@@ -455,13 +513,13 @@ select c.content, d.filename,
   from chunks c
   join documents d on d.id = c.document_id
  order by c.embedding <=> $1::vector                     -- nearest first
- limit 5
+ limit $2                                                -- topK (default 5)
 ```
 
 Overlapping chunking (server/chunk.ts)
 
 ```ts
-const step = size - overlap;                 // 200 - 40 = 160
+const step = Math.max(1, size - overlap);    // 200 - 40 = 160 (guarantees progress even when overlap ≥ size)
 for (let start = 0; start < words.length; start += step) {
   chunks.push(words.slice(start, start + size).join(" "));
   if (start + size >= words.length) break;
@@ -519,6 +577,10 @@ failure handling are written up separately in [RELIABILITY.en.md](RELIABILITY.en
   vanish if the server dies, and rooms split apart if I scale to several servers.
   Persistence and a Redis adapter are the next step. (The same limit as the
   in-memory cache on the document Q&A side.)
+- The KakaoTalk adapter goes as far as the skill server — the operational steps of
+  creating a channel and a bot in OpenBuilder and registering the skill URL are
+  separate. The local LLM chain is an optional configuration too, so the
+  deployment (Render) runs on Gemini alone.
 - Verification is still at the unit-test level. CI runs type checking, tests, and
   builds on every push and PR (`.github/workflows/ci.yml`), but everything I missed
   in 3 above happened at a boundary — behavior like socket origins or CSRF only
@@ -544,7 +606,7 @@ cd web && npm install && npm run dev   # http://localhost:5173
 Tests and the dashboard demo:
 
 ```bash
-cd server && npm test                # 109 unit tests
+cd server && npm test                # 147 unit tests
 cd server && npm run typecheck       # tsc only checks (no build output)
 cd server && npm run start:demo      # mock LLM mode — fault injection demo on the dashboard
 ```

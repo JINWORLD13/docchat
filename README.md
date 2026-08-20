@@ -10,6 +10,8 @@
 문서(txt, md)를 업로드하면 그 문서 내용을 근거로만 답변하는 RAG 챗봇임.
 여기에 여러 명이 같은 방에서 대화하는 실시간 채팅을 함께 넣었음.
 TypeScript, React, Express, PostgreSQL(pgvector), Socket.IO, Gemini API로 만들었음.
+생성은 로컬 LLM(Ollama)을 앞에 세우고 Gemini를 보루로 두는 체인 구성도 되고
+(env 한 줄), 같은 엔진을 카카오톡 챗봇(오픈빌더 스킬)으로도 노출함.
 
 한 서버가 두 종류의 실시간을 다룸 — 답변 토큰은 SSE(한 방향), 채팅은
 WebSocket(양방향 1:N). 왜 나누지 않고 한 프로세스에 뒀는지는
@@ -25,6 +27,8 @@ WebSocket(양방향 1:N). 왜 나누지 않고 한 프로세스에 뒀는지는
 ![문서에 없으면 거절](docs/demo-refusal.png)
 
 문서에 없는 내용이면 지어내지 않고 거절함. 이때 LLM은 호출조차 하지 않음.
+(질문에 이미지를 첨부했을 때만 예외 — 근거가 문서에서 이미지로 바뀌므로 거절하지
+않음. 아래 "질문에 이미지 첨부" 참고.)
 
 ![실시간 채팅](docs/demo-chat.png)
 
@@ -49,13 +53,17 @@ LLM API를 한 번 호출해서 답을 받는 것과, 믿고 쓸 수 있는 AI �
 
 ```
 [문서 업로드]
-파일 → 어절 단위로 겹치게 청킹 → Gemini 임베딩(768차원) → pgvector 저장
+파일 → 어절 단위로 겹치게 청킹 → 임베딩(기본 Gemini 768차원) → pgvector 저장
 
 [질문]
 질문 임베딩 → 코사인 유사도 검색 top 5
   → 최고 유사도 < 임계값 : 답변 거절 (LLM 호출 안 함)
+    (질문에 이미지가 붙어 있으면 거절하지 않음 — 근거가 이미지)
   → 통과 : 발췌를 프롬프트에 넣고 생성 → SSE 스트리밍
+    (생성기는 체인 — GENERATORS=ollama,gemini면 로컬 우선, 실패 시 Gemini)
 → 근거(출처)와 토큰 사용량 표시, query_logs에 기록
+
+같은 엔진이 전송만 바꿔 카카오톡 스킬(/api/kakao/skill)로도 답함
 ```
 
 ## 신경 쓴 부분
@@ -67,6 +75,12 @@ LLM API를 한 번 호출해서 답을 받는 것과, 믿고 쓸 수 있는 AI �
 거절함. 헛소리도 막고 토큰도 아낌. 임계값은 그냥 찍은 게 아니라 샘플 문서로
 관련 질문(유사도 0.66~0.74)과 무관 질문(0.53~0.59)을 재보고 그 사이로 잡았음.
 문서가 바뀌면 질문마다 `query_logs`에 남는 유사도를 보고 다시 맞춤.
+
+예외가 하나 있음 — 질문에 이미지를 첨부하면 거절하지 않음. 이 문턱은 "근거 없는
+답변"을 막으려는 것인데, 스크린샷을 올리고 "이 오류 뭐야"라고 물으면 근거는
+질문 텍스트가 아니라 이미지 안에 있음. 텍스트 유사도로 판정하면 정당한 질문이
+전부 막히므로, 그때는 발췌 없이(무관한 청크를 근거인 척 끼워 넣지 않고) 이미지만
+보고 답하게 함. 근거가 없어지는 게 아니라 문서에서 이미지로 바뀌는 것임.
 
 ```sql
 select question, refused, top_similarity from query_logs order by id desc limit 20;
@@ -93,18 +107,19 @@ HNSW 인덱스로 검색함. 문서 메타데이터랑 벡터를 한 DB에서 �
 
 Rate Limiter(Token Bucket), Admission Control(동시 상한 + 대기 데드라인),
 Bulkhead(커넥션 풀을 readPool·writePool·mediaPool 셋으로 격리 — 이미지 조회가
-질문 응답을 굶기지 않게), Circuit Breaker(임베딩·생성 각각), Graceful
-Degradation을 직접 구현했음. 병목은 추측하지 않고 부하를 걸어 측정했고(LLM이
-아니라 DB 풀이었음), 각 레이어의 동작을 단위 테스트로 고정했음.
-(`cd server && npm test` — 109개)
+질문 응답을 굶기지 않게), Circuit Breaker(임베딩·클라우드 생성·로컬 생성 각각),
+Graceful Degradation을 직접 구현했음. 병목은 추측하지 않고 부하를 걸어
+측정했고(LLM이 아니라 DB 풀이었음), 각 레이어의 동작을 단위 테스트로 고정했음.
+(`cd server && npm test` — 147개)
 
 설계 근거·대안 비교·측정값은 [RELIABILITY.md](RELIABILITY.md)에 정리했음.
 
 ### 실시간 채팅
 
-닉네임을 정하면 로비로 들어가고, 왼쪽 방 목록에서 방을 고르거나 새로 만들어
-입장함. 방 목록은 인원수와 함께 실시간으로 갱신되고, 방 안에서는 접속자 목록,
-입력 중 표시, 입·퇴장 알림, 재입장 시 최근 50개 기록까지 동작함.
+로그인하면(게스트는 닉네임만 정하면 바로 입장) 로비로 들어가고, 왼쪽 방 목록에서
+방을 고르거나 새로 만들어 입장함. 방 목록은 인원수와 함께 실시간으로 갱신되고,
+방 안에서는 접속자 목록, 입력 중 표시, 입·퇴장 알림, 재입장 시 최근 50개 기록까지
+동작함.
 
 방 "생성"과 "입장"을 따로 두지 않았음 — 없는 이름으로 들어가면 그 자리에서
 만들어지고, 마지막 사람이 나가면서 대화 기록도 없으면 목록에서 사라짐. 빈 방을
@@ -120,8 +135,10 @@ Degradation을 직접 구현했음. 병목은 추측하지 않고 부하를 걸�
 권한은 계정의 user id로만 판단함 — 앞의 것은 공개되지만 뒤의 것은 세션 쿠키
 (httpOnly)가 증명하므로 이름을 그대로 적어 보내도 흉내낼 수 없음. 소켓은 연결
 자체가 인증이라, 핸드셰이크의 세션 쿠키로 사용자를 확인하고 실패하면 연결을 거절함.
-질문·문서·이미지 API도 전부 이 세션 뒤에 있음(`/api/metrics`만 예외 — 담기는 게
-집계 수치뿐이고, 로그인이 안 되는 장애를 진단할 자리라 열어둠).
+질문·문서·이미지 API도 전부 이 세션 뒤에 있음. 예외는 둘 — `/api/metrics`(담기는 게
+집계 수치뿐이고, 로그인이 안 되는 장애를 진단할 자리라 열어둠)와
+`/api/kakao/skill`(부르는 쪽이 브라우저가 아니라 카카오 서버라 세션이 있을 수 없음
+— 대신 스킬 URL에 넣는 토큰으로 확인함).
 
 문서 Q&A와 같은 서버·같은 포트(4000)를 씀. 나누지 않은 이유는 전송 방식이 다를
 뿐 운영해야 할 프로세스를 늘릴 이유는 없기 때문임. 합치고 나니 오히려 중복이
@@ -154,6 +171,54 @@ Degradation을 직접 구현했음. 병목은 추측하지 않고 부하를 걸�
 "사수하겠다"고 말한 경로를 굶김. id가 uuid이고 내용이 안 바뀌므로 불변 캐시
 헤더를 줘서, DB까지 오는 건 각 이미지의 첫 요청뿐임.
 
+### 질문에 이미지 첨부
+
+문서 Q&A에서도 채팅처럼 ＋버튼, 붙여넣기(스크린샷), 드래그앤드롭으로 이미지를
+붙여 질문할 수 있음(멀티모달 생성). 저장소·업로드 경로는 실시간 채팅과 공용 —
+먼저 HTTP로 올리고 질문에는 id만 실음.
+
+**GIF는 질문에서만 막음.** 업로드는 채팅과 공용이라 gif도 통과하지만, Gemini의
+이미지 이해가 gif를 지원하지 않음. 여기서 안 거르면 업로드는 멀쩡히 되고 질문만
+500으로 터지는 데다, 사용자 실수가 LLM 회로 차단기에 실패로 쌓임 — 몇 명이
+gif를 올리면 회로가 열려 멀쩡한 질문까지 degrade되는, 남 탓으로 열리는 회로가 됨.
+
+**거절 게이트와의 관계는 위 "모르면 모른다고 답하게" 참고** — 이미지가 붙으면
+근거가 이미지라 유사도 거절을 하지 않음.
+
+### 생성기는 체인 — 로컬 우선, 클라우드는 보루
+
+`GENERATORS=ollama,gemini`라고 적으면 앞에서부터 시도하고, 앞이 실패하면 다음으로
+넘어감. 온디바이스 우선, 클라우드는 최후의 보루라는 구성이 env 한 줄이 됨(기본은
+gemini 하나). 조립은 `server/composition.ts` 한 곳에서만 함 — 전송(웹 SSE·카카오)마다
+각자 조립하면 "웹은 로컬 우선인데 카카오는 Gemini만" 같은 조용히 어긋난 두 시스템이 됨.
+
+**갈아타는 경계는 "첫 조각 전"임.** 이미 토큰이 화면에 흘러간 뒤에 다른 모델로
+갈아타면 앞부분이 중복되고 문체가 바뀐 답이 이어붙음. 그때는 폴백하지 않고
+degrade(출처는 남기고 생성만 포기)로 넘김. 로컬 전용 회로 차단기도 따로 둠 —
+Ollama가 죽으면 60초 타임아웃을 매번 기다리는 대신 회로가 열려 즉시 보루로 감.
+
+임베딩은 체인이 아니라 고정 스위치(`EMBEDDER=gemini|ollama`)임. 생성과 달리
+임베딩은 문서와 질문이 같은 모델이어야 해서(벡터 공간이 다르면 검색이 무의미)
+폴백이 불가능하고, 바꾸면 문서를 다시 업로드해야 함.
+
+### 카카오톡 챗봇 어댑터
+
+같은 RAG 엔진을 카카오톡 오픈빌더 스킬 웹훅(`/api/kakao/skill/<토큰>`)으로도
+노출함. 검색·거절·degrade 정책은 전부 코어가 정하므로, 웹에서 거절될 질문은
+카카오톡에서도 같은 문구로 거절됨.
+
+**웹과의 결정적 차이는 "언제 보내느냐"임.** SSE는 조각을 흘려보내면 되지만
+오픈빌더는 5초 안에 완성된 JSON 하나를 요구하고 스트리밍이 없음. 그래서 이벤트
+스트림을 시간 예산(기본 3.5초 — 카카오까지 돌아가는 네트워크 몫을 남김) 안에
+모으고, 예산 안에 끝나면 완답, 못 끝나면 콜백(비동기 답장)으로 넘기거나 부분
+답변이라도 전함. 예산 수집기는 express를 모르는 순수 함수라 가짜 이벤트만으로
+테스트됨(`kakao.test.ts`).
+
+rate limit은 IP가 아니라 카카오 사용자 id로 걺 — 요청이 전부 카카오 서버 IP로
+오므로 IP당 제한은 "전체 사용자 공용" 제한이 됨. 오픈빌더에는 요청 서명(HMAC)이
+없어서 스킬 URL에 비밀 토큰(`KAKAO_SKILL_TOKEN`)을 넣어 확인함. 실제로 쓰려면
+오픈빌더에서 채널·봇을 만들고 스킬 URL만 등록하면 됨.
+
 ### 이벤트 계약을 타입으로 고정
 
 HTTP는 경로를 틀리면 404가 바로 오지만, 소켓 이벤트는 이름이 문자열이라
@@ -179,7 +244,9 @@ Socket.IO를 제네릭으로 감싸 `emit`/`on`의 이름과 payload를 컴파�
 - 프론트: React (Vite) · SSE (답변 스트리밍 수신)
 - 백엔드: Node.js + Express + Socket.IO
 - DB: PostgreSQL + pgvector
-- AI: Gemini API — `gemini-embedding-001`(임베딩) + `gemini-3.6-flash`(생성), 무료 티어로 동작
+- AI: Gemini API — `gemini-embedding-001`(임베딩) + `gemini-3.6-flash`(생성), 무료 티어로 동작.
+  선택으로 로컬 LLM(Ollama)을 생성 체인 앞에(`GENERATORS`), 임베딩 교체는 `EMBEDDER`
+- 채널: 웹 (SSE) · 카카오톡 오픈빌더 스킬 (웹훅)
 - 인프라: Docker (로컬 pgvector) · Render (배포) · GitHub Actions (CI)
 
 ## 실행 방법
@@ -216,6 +283,9 @@ npm run dev   # http://localhost:5173
 루프백이라 비워두면 됨. 이 값을 채워 배포하면 번들에 평문으로 들어가 방문자
 누구나 읽을 수 있다는 점만 유의할 것(파일의 주의 사항 참고).
 
+첫 화면은 로그인임 — "게스트로 입장"에서 닉네임만 정하면 가입 없이 바로 시작됨
+(게스트도 서버에서는 계정 한 줄이라, 이후 로직에 "계정이 없을 수도 있는" 분기가 없음).
+
 `sample-docs/`의 문서 세 개를 올리고 이렇게 물어보면 됨.
 
 - "환불은 며칠 걸려?" → 문서 근거로 답변 + 출처 표시
@@ -242,59 +312,71 @@ docker exec -i docchat-db psql -U postgres -d docchat < server/schema.sql
 ```
 server/
   index.ts            Express 앱 + Socket.IO 부착, /api/health, /api/metrics,
-                      에러 미들웨어
+                      라우터 등록(rateLimit → requireLogin 순), 에러 미들웨어
   types.ts            SSE 이벤트 유니온, /api/metrics 응답 타입 (한 곳에서 관리)
+  composition.ts      조립 루트 — 엔진 부품·생성기 체인(GENERATORS)·임계값을
+                      정하는 유일한 곳 (웹·카카오가 같은 엔진을 공유)
   db.ts               pg 커넥션 풀 — 읽기·쓰기·미디어 세 개로 분리 (Bulkhead)
-  gemini.ts           임베딩 / 스트리밍 생성 / 지수 백오프 재시도
+  auth.ts             계정·세션 — scrypt 해시, 세션 캐시, requireLogin, 쿠키
+  gemini.ts           Gemini 임베딩 / 스트리밍 생성 / 지수 백오프 재시도
+  ollama.ts           로컬 LLM(Ollama) 임베딩·생성 클라이언트
+  embedding.ts        임베딩 공급자 스위치(EMBEDDER) + 질문 벡터 캐시 경유
+  prompt.ts           답변 프롬프트 조립 (Gemini·Ollama 공용)
+  kakao.ts            카카오 스킬 페이로드 해석·시간 예산 수집 (순수 — express를 모름)
   chunk.ts            겹침 청킹
   cache.ts            질문 임베딩 캐시 (TTL)
   imagetype.ts        업로드 바이트의 앞머리로 형식 판별 (SVG 제외)
   images.ts           채팅 이미지 저장/조회 (DB를 아는 코드를 여기 가둠)
-  tokenbucket.ts      Token Bucket 알고리즘 — HTTP·소켓 제한이 공유
+  tokenbucket.ts      Token Bucket 알고리즘 — HTTP·소켓 제한 여덟 곳이 공유
   ratelimit.ts        사용자(IP)별 HTTP 요청 제한
   clientip.ts         프록시 뒤에서 진짜 클라이언트 IP 고르기 (소켓용)
   origins.ts          오리진 허용 판정 — HTTP·소켓·CSRF 검사가 공유
   admission.ts        동시 처리 상한 + 대기 데드라인 (load shedding)
-  breaker.ts          회로 차단기 — 임베딩용·생성용 두 개
+  breaker.ts          회로 차단기 — 임베딩·클라우드 생성·로컬 생성 세 개
   admin.ts            장애 주입 엔드포인트 보호 (토큰 / 루프백)
   faults.ts           런타임 장애 주입 스위치 (데모용)
   rag/
     types.ts          코어가 주고받는 값과 포트 (express·pg·genai를 import하지 않음)
     engine.ts         질문 → 이벤트 흐름. 검색·거절·degrade 정책이 전부 여기
   adapters/
-    embedder.ts       Embedder 포트 = Gemini 임베딩 + 회로
+    embedder.ts       Embedder 포트 = 임베딩 + 회로
     store.ts          VectorStore 포트 = pgvector 코사인 검색
-    generator.ts      AnswerGenerator 포트 = Gemini 생성 + 회로
+    generator.ts      AnswerGenerator 포트 = Gemini·Ollama 생성 + 회로 + 폴백 체인
     logger.ts         QueryLogger 포트 = query_logs 적재
   routes/
+    auth.ts           /api/auth — 가입·로그인·게스트 입장·로그아웃·me
     documents.ts      업로드, 목록, 원문 열람(GET), 수정(PUT), 삭제
-    chat.ts           코어를 HTTP/SSE에 연결 (전송과 과부하 제어만 남김)
+    chat.ts           코어를 HTTP/SSE에 연결 (전송·과부하 제어·이미지 로드만)
+    kakao.ts          카카오 스킬 웹훅 — 5초 예산 + 콜백 폴백 + 부분 답변
     images.ts         채팅 이미지 업로드(POST) / 조회(GET, 불변 캐시)
   realtime/
     types.ts          소켓 이벤트 계약 (web와 짝)
-    gateway.ts        연결·입장·브로드캐스트·퇴장 핸들러
+    gateway.ts        연결(핸드셰이크 = 세션 인증)·입장·브로드캐스트·퇴장 핸들러
     rooms.ts          방 상태 (메시지 50개 + 접속자) 메모리
-    ratelimit.ts      IP별 도배 제한 (연결이 끊겨도 예산은 남음)
-    identity.ts       표시용 닉네임과 권한용 신원을 분리 (HMAC)
+    ratelimit.ts      IP별 도배·핸드셰이크 제한 (연결이 끊겨도 예산은 남음)
+    payload.ts        소켓 페이로드 안전 파싱 (경계에서 모양 검사)
   scripts/            부하 테스트, 캐시 벤치, 방어 레이어 시연
   schema.sql
   tsconfig.json       빌드 없음 — Node가 타입을 벗겨 실행, tsc는 검사만
-  *.test.ts           단위 테스트 109개
-                      (RAG 코어·청킹·token bucket·rate limit·breaker·admission
-                       ·rooms·imagetype·소켓 페이로드·클라이언트 IP·오리진 판정
-                       ·소켓 도배 제한)
+  *.test.ts           단위 테스트 147개
+                      (RAG 코어·코어 경계·청킹·token bucket·rate limit·breaker
+                       ·admission·rooms·imagetype·소켓 페이로드·클라이언트 IP
+                       ·오리진 판정·소켓 도배 제한·계정/세션·카카오 어댑터
+                       ·Ollama 스트림·생성기 폴백 체인)
 web/
   src/
     types.ts          서버와 맞춘 계약 (문서·SSE 이벤트·metrics)
-    api.ts            fetch + SSE 파싱 (이벤트별 핸들러 디스패치)
-    App.tsx           상단 탭 — 문서 Q&A / 실시간 채팅 / 대시보드
-    components/       Sidebar(업로드/목록) / Chat / Message(근거 표시)
-                      DocModal(열람·수정 팝업) / Dashboard(부하·장애 대시보드)
+    api.ts            fetch + SSE 파싱 + 인증 호출 (401 → 로그인 화면 복귀)
+    images.ts         이미지 첨부 프런트 유틸 (업로드 → id)
+    App.tsx           AuthGate 뒤의 상단 탭 — 문서 Q&A / 실시간 채팅 / 대시보드
+    components/       AuthGate(게스트·로그인·가입) / Sidebar(업로드/목록) / Chat
+                      Message(근거 표시) / DocModal(열람·수정 팝업)
+                      Dashboard(부하·장애 대시보드)
     realtime/
       types.ts        소켓 이벤트 계약 (server와 짝)
       socket.ts       타입 있는 소켓 (같은 오리진에 연결)
-      LiveChat.tsx    소켓 연결 관리 + 닉네임 → 로비 → 방 전환
-      Nickname.tsx    닉네임 입력
+      session.ts      탭 저장소 (마지막 방 이름)
+      LiveChat.tsx    소켓 연결 관리 + 로비 → 방 전환
       RoomList.tsx    방 목록 + 새 방 만들기
       Room.tsx        구독·전송·접속자 목록
   vite.config.ts      /api 프록시 + /socket.io 프록시(ws)

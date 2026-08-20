@@ -48,6 +48,11 @@ request
   │
   ▼ [1] Rate Limiter (per user)     stop one user's flood from paralyzing everyone, at the front
   │
+  ▼ [1.5] Auth gate (requireLogin)  no session, 401. Why it sits after rateLimit:
+  │                                  the session lookup can touch the DB, so putting it
+  │                                  first lets a made-up cookie force a DB round trip
+  │                                  per request (the cheap check goes first)
+  │
   ▼ [2] Admission Control (global)  cap on concurrency. Over it, immediate 429 instead of waiting forever
   │
   ▼ [3] Bulkhead (resource isolation)  split read/write/media pools. Write and image floods don't block questions
@@ -56,20 +61,28 @@ request
   │                                  (if this dies we can't even retrieve, so degradation isn't possible)
   │
   ▼ [5] Retrieval + refusal gate    if nothing is relevant, don't call the LLM (less load + no nonsense)
+  │                                  (a question with an image attached is the exception — the evidence is the image)
   │
   ▼ [6] Circuit Breaker (generation)  if the LLM keeps failing, open the circuit and substitute a response
+  │                                  (with a GENERATORS chain there's a separate local circuit,
+  │                                   so when local dies it falls back to the last resort (Gemini)
+  │                                   before the first chunk)
   │
   ▼ [7] Generation (Degradation on failure)  even if the LLM fails, return the sources. Nobody leaves empty-handed
 ```
 
-The first three are prevention (don't collapse); the last three are degradation
-(don't die when you overflow). Why there are two circuits is in section 4 — even
-with the same vendor, what you can do when one fails is different. You can inject
-these layers with buttons on the dashboard and watch them react live (section 9).
+The earlier layers are prevention (don't collapse); the later ones are degradation
+(don't die when you overflow). Why there are several circuits is in section 4 —
+what you can do when each one fails is different. You can inject these layers with
+buttons on the dashboard and watch them react live (section 9).
 
-That order is the HTTP question path. A real-time chat message goes through the
-same algorithm as [1] with different values (section 2) and skips the rest of the
-layers — it touches neither the LLM nor the DB.
+That order is the HTTP question path. A real-time chat text message goes through
+the same algorithm as [1] with different values (section 2) and skips the rest of
+the layers — it touches neither the LLM nor the DB. The socket connection itself,
+though, looks the session up at the handshake (cache first, readPool on a miss),
+and an image message passes through mediaPool for its metadata check and deletion.
+The KakaoTalk skill path changes only [1]'s key, from the IP to the Kakao user id,
+and rides the same order for the rest.
 
 ---
 
@@ -108,6 +121,14 @@ had to be the same across the two paths and what had to differ.
 | Refill per second | 5 | 2 |
 | Bucket key | IP | IP (connections are counted separately for the concurrent-connection cap) |
 | Bucket reclamation | sweep — cleaned after 10 minutes idle | sweep — same |
+
+Today eight uses share this class, differing only in values. On top of the two
+above — chat actions (join·typing, 20·10), the socket handshake (10·1 — so
+repeated attempts can't force the pre-auth session lookup), image upload (5·0.5)
+and fetch (120·20), login/sign-up (10·0.17, password-guessing defense, so it
+recovers once every 6 seconds), and the Kakao skill (5·0.5, where every request
+arrives from Kakao's server IPs, so the key is the Kakao user id rather than the
+IP).
 
 Why the values differ: an HTTP question is expensive (an embedding plus an LLM
 round trip) and arrives rarely. A chat message is cheap and arrives often. And yet
@@ -257,7 +278,8 @@ from set — so sharing one cache means that from the moment enough distinct
 questions fill the ceiling, no new session can be cached and every authenticated
 request goes to the DB: a question flood was a path to breaking login. It also
 splits the metric: /api/metrics' cache hit rate is once again the hit rate of the
-question-embedding cache alone.
+question-embedding cache alone (mix in session lookups, which almost always hit,
+and that number can no longer tell you anything about the embedding cache).
 
 Result (R)
 /api/metrics exposes the waiting count for all three pools separately. On the
@@ -290,8 +312,15 @@ one fails is different.
 
 Tie them together and a generation outage blocks embedding too, so you can't return
 sources even when you could have — which makes the Graceful Degradation in section
-5 useless. So the circuit was split in two (`breaker.llm`, `breaker.embed`) and each
-does the best it can. The dashboard shows both states.
+5 useless. So the circuits were split (`breaker.llm`, `breaker.embed`) and each
+does the best it can.
+
+The local LLM chain (GENERATORS=ollama,gemini) brought a third circuit
+(`breaker.local`) with it. When local stalls (model not installed, Ollama down),
+instead of waiting out the timeout every time, the circuit opens and it falls back
+to the last resort (Gemini) immediately. A Gemini outage and a local outage are
+independent, so the circuits are separate too — local dying must not cut off cloud
+generation. The dashboard shows all three states (embedding · generation · local).
 
 What I was worried about (P)
 When the external LLM fails, retries compound and every request hangs for seconds
@@ -387,7 +416,7 @@ blocked as flooding) all at once. (Prometheus + Grafana in production.)
 ```bash
 cd server                     # there's no package.json at the root. Everything below is relative to server/
 
-# unit tests for the defense layers (109)
+# all unit tests (147)
 npm test
 
 # cache effect (real Gemini)
@@ -416,7 +445,7 @@ k6 or Artillery. The server has no build step. Node strips the types and runs
 `node index.ts` directly, and `tsc` is only a checker (`npm run typecheck`). The
 paths in the commands above are the source paths.
 
-### What I pinned with tests rather than measurements (109)
+### What I pinned with tests rather than measurements (147)
 
 A measurement only shows "this is the number right now"; it doesn't guarantee the
 behavior is still the same in the next commit. So when each layer should fire is
@@ -425,16 +454,22 @@ pinned by unit tests.
 | File | Count | What it pins |
 |---|---|---|
 | realtime/rooms.test.ts | 31 | No ghost users, empty rooms cleaned up, history capped at 50, room isolation, no unbounded room growth, the same nickname still can't delete someone else's |
+| rag/engine.test.ts | 13 | The question → event flow — the refusal gate (image exception included), sources-first delivery, degrade. Fake ports, no DB or API |
+| kakao.test.ts | 11 | Skill payload shape checks, time-budget collection (complete/partial), response assembly — with fake events alone |
+| auth.test.ts | 11 | Password verification returns true/false on any input without throwing (so a 401 can't become a 500), dummy hash shape, cookie parsing, the login gate, destroy shape checks |
 | breaker.test.ts | 9 | Circuit opens at the threshold, recovers after cooldown, only one trial request while half-open |
 | tokenbucket.test.ts | 8 | The algorithm itself — burst tolerance, token refill, per-key isolation, drop/sweep reclamation |
 | imagetype.test.ts | 8 | Upload format detection — disguised SVG and HTML rejected, doesn't blow up on truncated files |
 | clientip.test.ts | 8 | Picking the real IP behind a proxy — which way it breaks when the hop count is wrong |
+| origins.test.ts | 8 | Other origins blocked, same origin (our own screen, deployed together) allowed |
+| realtime/ratelimit.test.ts | 7 | Flood budget doesn't come back after disconnect and reconnect, cap on concurrent connections per IP, cap on handshake attempts |
 | admission.test.ts | 6 | Concurrency cap, immediate rejection when the queue overflows, the wait deadline |
 | realtime/payload.test.ts | 6 | Handlers survive socket payloads that are null, a number, or an empty object |
-| origins.test.ts | 8 | Other origins blocked, same origin (our own screen, deployed together) allowed |
-| realtime/ratelimit.test.ts | 5 | Flood budget doesn't come back after disconnect and reconnect, cap on concurrent connections per IP |
+| adapters/generator.test.ts | 6 | When the circuit counts success (only once the stream is consumed to the end), fallback boundary is "before the first chunk" only |
+| ollama.test.ts | 5 | Parsing the local generation stream, distinguishing errors |
 | ratelimit.test.ts | 4 | Whether that algorithm is attached to HTTP correctly — 429, Retry-After header, IP as the key |
 | chunk.test.ts | 3 | Document splitting |
+| rag/boundary.test.ts | 3 | That the core (rag/) imports no express, pg, or genai — testing the boundary itself |
 
 The last three files listed here (clientip, origins, realtime/ratelimit) were added
 later, and for the same reason — all three are places where **behavior this document
@@ -675,7 +710,7 @@ Two things worth flagging:
 | A cap on wait time, not just queue length | Give up past the deadline; immediate rejection and wait-timeout observed separately |
 | Read / write / media pool isolation (bulkhead) | Write and image floods don't block question retrieval |
 | Circuit breaker on the LLM | Circuit opens after 5 failures, latency 500 → 190ms |
-| Split the circuit into embedding and generation | Embedding outages now hit a circuit too (before, it was outside and never opened) |
+| Split the circuit into embedding, generation, and local generation | Embedding outages now hit a circuit too (before, it was outside and never opened). When local dies, straight to the last resort (Gemini) |
 | Set TRUST_PROXY in the deployment + same calculation for sockets | Everyone collapsing into one IP became actual per-IP |
 | Reject socket origins in allowRequest | The websocket-pinned bypass is closed (the cors option alone didn't block it) |
 | Origin check on state-changing requests | The preflight-free CSRF path is closed |
@@ -684,4 +719,4 @@ Two things worth flagging:
 | Graceful degradation on failure | Sources returned even with the LLM dead, error rate 0 |
 | Question embedding cache | Repeated questions 1197ms → 0.05ms |
 | Log writes moved to the background | p99 2794 → 1606ms (-42%) |
-| Injecting the clock in tests | Deterministic without waiting; layer behavior pinned by 109 tests |
+| Injecting the clock in tests | Deterministic without waiting; layer behavior pinned by 147 tests |
