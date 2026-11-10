@@ -119,7 +119,7 @@ Bulkhead(コネクションプールをreadPool·writePool·mediaPoolの3つに�
 画像の取得が質問応答を飢えさせないように)、Circuit Breaker(埋め込み・クラウド生成・
 ローカル生成それぞれ)、Graceful Degradationを自前で実装した。ボトルネックは推測せず、
 実際に負荷をかけて測定し(LLMではなくDBプールだった)、各レイヤーの挙動を単体テストで
-固定した。(`cd server && npm test` — 147件)
+固定した。(`cd server && npm test` — 152件)
 
 施策ごとの実測（同時50接続・LLMはmockで隔離）: Admission Controlでプール待機列
 88 → 6、回路オープンで障害中の遅延 500 → 190ms（ハードエラー0）、埋め込み
@@ -392,7 +392,7 @@ server/
   scripts/            負荷テスト, キャッシュベンチ, 防御レイヤーのデモ
   schema.sql
   tsconfig.json       ビルドなし — Nodeが型を剥がして実行, tscは検査のみ
-  *.test.ts           単体テスト147件
+  *.test.ts           単体テスト152件
                       (RAGコア·コアの境界·チャンキング·token bucket·rate limit·breaker
                        ·admission·rooms·imagetype·ソケットのペイロード·クライアントIP
                        ·オリジン判定·ソケットの連投制限·アカウント/セッション·カカオ

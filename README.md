@@ -110,7 +110,7 @@ Bulkhead(커넥션 풀을 readPool·writePool·mediaPool 셋으로 격리 — �
 질문 응답을 굶기지 않게), Circuit Breaker(임베딩·클라우드 생성·로컬 생성 각각),
 Graceful Degradation을 직접 구현했음. 병목은 추측하지 않고 부하를 걸어
 측정했고(LLM이 아니라 DB 풀이었음), 각 레이어의 동작을 단위 테스트로 고정했음.
-(`cd server && npm test` — 147개)
+(`cd server && npm test` — 152개)
 
 조치별 실측(동시 50 연결 · mock LLM 격리): admission control로 풀 대기열 88 → 6,
 회로 오픈으로 장애 중 지연 500 → 190ms(하드 에러 0), 임베딩 캐시 미스 1197ms →
@@ -362,7 +362,7 @@ server/
   scripts/            부하 테스트, 캐시 벤치, 방어 레이어 시연
   schema.sql
   tsconfig.json       빌드 없음 — Node가 타입을 벗겨 실행, tsc는 검사만
-  *.test.ts           단위 테스트 147개
+  *.test.ts           단위 테스트 152개
                       (RAG 코어·코어 경계·청킹·token bucket·rate limit·breaker
                        ·admission·rooms·imagetype·소켓 페이로드·클라이언트 IP
                        ·오리진 판정·소켓 도배 제한·계정/세션·카카오 어댑터

@@ -467,7 +467,7 @@ not absolute values.
 
 Tests
 
-147 unit tests passing (`npm test`). Focused on pure logic that runs with no external
+152 unit tests passing (`npm test`). Focused on pure logic that runs with no external
 dependencies.
 
 | Target | Count | What it verifies |
@@ -477,8 +477,8 @@ dependencies.
 | Chunking | 3 | Short text is 1 chunk, long text splits with overlap, the overlapping region matches |
 | Rate Limiter | 4 | Capacity passes, the excess gets 429, per-IP isolation, tokens refill over time |
 | Token Bucket | 8 | Bursts allowed, excess rejected, retry-after reported, refill cap, per-key isolation, drop and sweep reclamation |
-| Circuit Breaker | 9 | Opens at the threshold, counter resets on success, recovers after cooldown, only one trial request while half-open |
-| Generator fallback chain | 6 | When the circuit counts success (only once the stream is consumed to the end), fallback boundary is "before the first chunk" only |
+| Circuit Breaker | 12 | Opens at the threshold, counter resets on success, recovers after cooldown, only one trial request while half-open, an abandoned trial returns its token without being counted as a failure |
+| Generator fallback chain | 8 | When the circuit counts success (only once the stream is consumed to the end), fallback boundary is "before the first chunk" only, a trial cut off mid-stream does not leave the circuit open forever |
 | Admission Control | 6 | Passes up to the cap, yields to the queue, immediate rejection when the queue is full, wait deadline |
 | Accounts & sessions | 11 | Password verification returns true/false on any input without throwing, dummy hash shape, cookie parsing, the login gate (401), destroy shape checks |
 | Chat room management | 31 | Removed from the list on leave (no ghost users), empty rooms cleaned up (no memory leak), history capped at 50, rooms isolated, no unbounded room growth, same nickname still can't delete someone else's, a message to a nonexistent room doesn't resurrect it |
@@ -628,7 +628,7 @@ cd web && npm install && npm run dev   # http://localhost:5173
 Tests and the dashboard demo:
 
 ```bash
-cd server && npm test                # 147 unit tests
+cd server && npm test                # 152 unit tests
 cd server && npm run typecheck       # tsc only checks (no build output)
 cd server && npm run start:demo      # mock LLM mode — fault injection demo on the dashboard
 ```

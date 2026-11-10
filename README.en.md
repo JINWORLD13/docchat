@@ -128,7 +128,7 @@ so image fetches don't starve question answering), Circuit Breaker (one each for
 embedding, cloud generation, and local generation), and Graceful Degradation
 myself. I didn't guess at the bottleneck; I put load on it and measured (it was the
 DB pool, not the LLM), and pinned each layer's behavior with unit tests.
-(`cd server && npm test` — 147 of them)
+(`cd server && npm test` — 152 of them)
 
 Measured per measure (50 concurrent connections, LLM mocked out): admission
 control cut the pool queue 88 → 6; an open circuit cut mid-outage latency
@@ -426,7 +426,7 @@ server/
   scripts/            load test, cache bench, defense layer demo
   schema.sql
   tsconfig.json       no build — Node strips types and runs, tsc only checks
-  *.test.ts           147 unit tests
+  *.test.ts           152 unit tests
                       (RAG core · core boundary · chunking · token bucket · rate limit
                        · breaker · admission · rooms · imagetype · socket payloads
                        · client IP · origin decision · socket flood limit

@@ -302,6 +302,30 @@ the whole time. Free-tier embedding 429s are an everyday event, so this was a pa
 that actually got walked, and this document's claim that it "doesn't cling to dead
 dependencies" was exactly half true.
 
+The second hole ran the other way — the circuit failing to **close**. When the
+cooldown ends, `isOpen()` hands out a trial token (`probing`) and lets exactly one
+request through to check for recovery. But if the user closes the tab during that
+trial request, the core breaks out of its `for await` and the generator is closed at
+its yield point — neither the catch nor the success path runs. That is the very
+mechanism that upholds "a user who left is not a failure" (otherwise a few page
+refreshes would open the circuit), but the trial token vanished along with it.
+`probing` stayed stuck at true, so `isOpen()` returned true forever even after the
+cooldown passed, and from then on every question fell through to degraded. The only
+recovery was `/api/admin/reset` or a restart.
+
+This is not an edge case — routes/chat.ts wires abort to `res.on("close")`, and
+routes/kakao.ts cuts the stream on every question that overruns the 5-second budget.
+It is reachable from both channels.
+
+Worse, `state()` only looks at the cooldown, so in that condition it reported
+`open: false`. While every request was being blocked, the dashboard displayed
+"circuit closed" — the standard I wrote down in section 6, that only grounded values
+go on screen, was not applied to the circuit itself. The fix: a `finally` in
+`breakered` so a request that was never judged releases **just the seat** via
+`onAbandoned()` (counters untouched — there is no basis to judge on), plus a
+`probing` field on `BreakerState` so the screen can distinguish "half-open ·
+verifying recovery."
+
 Merging them into one circuit wasn't an option either. What you can do when each
 one fails is different.
 
@@ -335,6 +359,15 @@ to a substitute response. After the cooldown it tries again and recovers
 automatically if things are healthy. In production I'd use a proven library like
 opossum; here I wrote a minimal implementation to show I understand the pattern
 directly.
+
+You can't just throw the gate open the instant the cooldown ends — the requests
+that piled up would rush an API that may still be dead, all at once (up to
+MAX_INFLIGHT=8). The whole reason for the circuit is "don't keep knocking on a dead
+dependency," and that is precisely what you'd be doing at the moment you check for
+recovery. So half-open lets exactly one request through and judges on its result.
+That judgment has three branches: success (close the circuit), failure (cool down
+again), and **no verdict** (the user left) — missing the third one was the second
+hole above.
 
 Result (R) — injected a fault where the LLM "hangs 300ms and fails," 9 requests
 ```
@@ -409,14 +442,16 @@ scanning all of them — it finds approximate nearest neighbors.
 
 Monitoring is decision-making power. You have to see which layer fired and when to
 find the cause of an outage within seconds. GET /api/metrics exposes cache hit
-rate, pool state, rate limit rejection counts, current concurrency, circuit state,
-and the real-time chat side (`realtime` — room count, connected users, messages
-blocked as flooding) all at once. (Prometheus + Grafana in production.)
+rate, pool state, rate limit rejection counts, current concurrency, circuit state
+(open · **half-open** · closed — half-open is the window where only one trial gets
+through, so it cannot be the same value as `open`), and the real-time chat side
+(`realtime` — room count, connected users, messages blocked as flooding) all at
+once. (Prometheus + Grafana in production.)
 
 ```bash
 cd server                     # there's no package.json at the root. Everything below is relative to server/
 
-# all unit tests (147)
+# all unit tests (152)
 npm test
 
 # cache effect (real Gemini)
@@ -445,7 +480,7 @@ k6 or Artillery. The server has no build step. Node strips the types and runs
 `node index.ts` directly, and `tsc` is only a checker (`npm run typecheck`). The
 paths in the commands above are the source paths.
 
-### What I pinned with tests rather than measurements (147)
+### What I pinned with tests rather than measurements (152)
 
 A measurement only shows "this is the number right now"; it doesn't guarantee the
 behavior is still the same in the next commit. So when each layer should fire is
@@ -457,7 +492,7 @@ pinned by unit tests.
 | rag/engine.test.ts | 13 | The question → event flow — the refusal gate (image exception included), sources-first delivery, degrade. Fake ports, no DB or API |
 | kakao.test.ts | 11 | Skill payload shape checks, time-budget collection (complete/partial), response assembly — with fake events alone |
 | auth.test.ts | 11 | Password verification returns true/false on any input without throwing (so a 401 can't become a 500), dummy hash shape, cookie parsing, the login gate, destroy shape checks |
-| breaker.test.ts | 9 | Circuit opens at the threshold, recovers after cooldown, only one trial request while half-open |
+| breaker.test.ts | 12 | Circuit opens at the threshold, recovers after cooldown, only one trial request while half-open, an abandoned trial returns its token (so the circuit can't stay open forever) without being counted as a failure, half-open exposed as state |
 | tokenbucket.test.ts | 8 | The algorithm itself — burst tolerance, token refill, per-key isolation, drop/sweep reclamation |
 | imagetype.test.ts | 8 | Upload format detection — disguised SVG and HTML rejected, doesn't blow up on truncated files |
 | clientip.test.ts | 8 | Picking the real IP behind a proxy — which way it breaks when the hop count is wrong |
@@ -465,7 +500,7 @@ pinned by unit tests.
 | realtime/ratelimit.test.ts | 7 | Flood budget doesn't come back after disconnect and reconnect, cap on concurrent connections per IP, cap on handshake attempts |
 | admission.test.ts | 6 | Concurrency cap, immediate rejection when the queue overflows, the wait deadline |
 | realtime/payload.test.ts | 6 | Handlers survive socket payloads that are null, a number, or an empty object |
-| adapters/generator.test.ts | 6 | When the circuit counts success (only once the stream is consumed to the end), fallback boundary is "before the first chunk" only |
+| adapters/generator.test.ts | 8 | When the circuit counts success (only once the stream is consumed to the end), fallback boundary is "before the first chunk" only, a trial request cut off mid-stream does not leave the circuit open forever |
 | ollama.test.ts | 5 | Parsing the local generation stream, distinguishing errors |
 | ratelimit.test.ts | 4 | Whether that algorithm is attached to HTTP correctly — 429, Retry-After header, IP as the key |
 | chunk.test.ts | 3 | Document splitting |
@@ -711,6 +746,7 @@ Two things worth flagging:
 | Read / write / media pool isolation (bulkhead) | Write and image floods don't block question retrieval |
 | Circuit breaker on the LLM | Circuit opens after 5 failures, latency 500 → 190ms |
 | Split the circuit into embedding, generation, and local generation | Embedding outages now hit a circuit too (before, it was outside and never opened). When local dies, straight to the last resort (Gemini) |
+| Treat an abandoned trial request as its own branch of the verdict | A request that left holding the trial token used to leave the circuit open forever (while the screen showed "closed") |
 | Set TRUST_PROXY in the deployment + same calculation for sockets | Everyone collapsing into one IP became actual per-IP |
 | Reject socket origins in allowRequest | The websocket-pinned bypass is closed (the cors option alone didn't block it) |
 | Origin check on state-changing requests | The preflight-free CSRF path is closed |
@@ -719,4 +755,4 @@ Two things worth flagging:
 | Graceful degradation on failure | Sources returned even with the LLM dead, error rate 0 |
 | Question embedding cache | Repeated questions 1197ms → 0.05ms |
 | Log writes moved to the background | p99 2794 → 1606ms (-42%) |
-| Injecting the clock in tests | Deterministic without waiting; layer behavior pinned by 147 tests |
+| Injecting the clock in tests | Deterministic without waiting; layer behavior pinned by 152 tests |
