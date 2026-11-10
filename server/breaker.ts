@@ -27,12 +27,20 @@ export interface BreakerState {
   open: boolean;
   consecutiveFailures: number;
   reopensInMs: number;
+  // 쿨다운은 지났고 복구를 확인하는 시험 요청 하나가 나가 있는 상태.
+  // open과 따로 두는 이유: 이때 통과하는 건 그 한 건뿐이고 나머지는 계속
+  // 막히는데, open만 보면 "닫혔다"로 읽혀 화면이 실제와 다른 말을 한다.
+  // 관제 화면에 근거 없는 값을 올리지 않으려면 이 구간이 보여야 한다.
+  probing: boolean;
 }
 
 export interface Breaker {
   isOpen(): boolean;
   onSuccess(): void;
   onFailure(): void;
+  // 시험 요청이 성공도 실패도 아닌 채로 사라졌다. 반드시 불러야 한다 — 이유는
+  // 구현부 주석에 있다(안 부르면 회로가 영구히 열린 채 남는다).
+  onAbandoned(): void;
   state(): BreakerState;
   reset(): void;
 }
@@ -82,6 +90,22 @@ export function createBreaker(threshold: number, cooldownMs: number): Breaker {
       }
     },
 
+    // 시험 요청이 판정되지 않고 사라졌다(사용자가 떠나 스트림이 중간에 닫힘).
+    //
+    // 실패로 세지 않는다. 떠난 사용자를 실패로 세면 새로고침 몇 번에 회로가
+    // 열려 멀쩡한 API를 차단하게 된다(adapters/generator.ts의 규칙).
+    //
+    // 그렇다고 아무것도 안 하면 안 된다. 그 요청이 반열림 시험권을 들고
+    // 갔으므로, 돌려놓지 않으면 probing이 true로 굳는다. 그러면 쿨다운이
+    // 끝나도 isOpen()이 영원히 true를 주고 — 그런데 state()는 쿨다운만 보니
+    // open: false를 보고한다 — 화면에는 "닫힘"이 뜬 채로 모든 요청이 degrade로
+    // 떨어진다. 재시작 말고는 복구가 없는 상태다. 실제로 그랬다.
+    //
+    // 판정할 근거가 없을 때 할 일은 "판정하지 않되 자리는 비우는 것"이다.
+    onAbandoned(): void {
+      probing = false;
+    },
+
     // 대시보드·메트릭용. isOpen()과 달리 아무것도 소비하지 않는다 —
     // 예전엔 여기서 isOpen()을 불렀는데, 그러면 대시보드가 1초마다 상태를 읽는
     // 것만으로 복구 시험권을 가로채 실제 요청이 영영 회로를 못 열게 된다.
@@ -91,6 +115,9 @@ export function createBreaker(threshold: number, cooldownMs: number): Breaker {
         open,
         consecutiveFailures,
         reopensInMs: open ? openUntil - Date.now() : 0,
+        // 쿨다운이 끝났지만 아직 복구를 확인 못 한 구간. 여기서도 요청은
+        // (시험 한 건을 빼고) 계속 막히므로 화면이 이걸 알아야 한다.
+        probing: !open && probing && consecutiveFailures >= threshold,
       };
     },
 
@@ -124,6 +151,7 @@ export const local = createBreaker(THRESHOLD, COOLDOWN_MS);
 export const isOpen = (): boolean => llm.isOpen();
 export const onSuccess = (): void => llm.onSuccess();
 export const onFailure = (): void => llm.onFailure();
+export const onAbandoned = (): void => llm.onAbandoned();
 export const breakerState = (): BreakerState => llm.state();
 
 // 데모 재실행용. 회로를 전부 함께 초기화한다 — 대시보드의 "리셋"은

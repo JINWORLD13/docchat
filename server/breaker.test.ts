@@ -105,7 +105,57 @@ test("상태 조회는 시험권을 소비하지 않는다", async () => {
   assert.equal(breaker.isOpen(), false, "시험권은 실제 요청 몫으로 남아 있어야 한다");
 });
 
+test("판정되지 않고 사라진 시험 요청은 시험권을 반납한다", async () => {
+  // 여기가 회귀 지점이다. 시험 요청이 성공도 실패도 아닌 채로 끝나는 경우가
+  // 실제로 있다 — 사용자가 탭을 닫거나(routes/chat.ts), 카카오의 5초 예산이
+  // 끝나 스트림을 끊을 때(routes/kakao.ts). 그때 시험권을 돌려놓지 않으면
+  // probing이 true로 굳어 쿨다운이 끝나도 회로가 영원히 열린 채 남는다.
+  breaker.reset();
+  for (let i = 0; i < 3; i++) breaker.onFailure();
+  await sleep(120);
+
+  assert.equal(breaker.isOpen(), false, "시험 요청이 나간다");
+  breaker.onAbandoned(); // 그 요청이 판정되지 않고 사라졌다
+
+  assert.equal(
+    breaker.isOpen(),
+    false,
+    "다음 요청이 다시 복구를 확인할 수 있어야 한다 (영구 차단이 아니라)"
+  );
+});
+
+test("사라진 시험 요청을 실패로 세지 않는다", () => {
+  // 떠난 사용자를 실패로 세면 새로고침 몇 번에 회로가 열려 멀쩡한 API를
+  // 차단한다. 자리는 비우되 판정은 하지 않는 것이 핵심이다.
+  breaker.reset();
+  for (let i = 0; i < 3; i++) breaker.onFailure();
+  const before = breaker.breakerState().consecutiveFailures;
+
+  breaker.onAbandoned();
+
+  assert.equal(breaker.breakerState().consecutiveFailures, before);
+});
+
+test("반열림 구간을 상태로 알린다 (화면이 '닫힘'이라 말하지 않게)", async () => {
+  // 쿨다운이 끝나면 open은 false가 된다. 그런데 그 구간에도 요청은 시험 한 건을
+  // 빼고 계속 막힌다 — open만 보면 화면이 "정상"이라고 말하는 셈이다.
+  breaker.reset();
+  for (let i = 0; i < 3; i++) breaker.onFailure();
+  await sleep(120);
+
+  breaker.isOpen(); // 시험 요청이 나갔다
+  const s = breaker.breakerState();
+
+  assert.equal(s.open, false, "쿨다운은 끝났다");
+  assert.equal(s.probing, true, "하지만 아직 복구를 확인하는 중이다");
+
+  breaker.onSuccess();
+  assert.equal(breaker.breakerState().probing, false, "확인이 끝나면 내려간다");
+});
+
 test("reset은 회로와 카운터를 모두 초기화한다", () => {
+  // 시험권까지 반납된 상태여야 한다 — reset은 "장애 이전으로 돌린다"는 뜻이라
+  // probing이 남아 있으면 리셋 직후부터 요청이 막힌다.
   for (let i = 0; i < 3; i++) breaker.onFailure();
   breaker.reset();
 
@@ -113,5 +163,6 @@ test("reset은 회로와 카운터를 모두 초기화한다", () => {
     open: false,
     consecutiveFailures: 0,
     reopensInMs: 0,
+    probing: false,
   });
 });

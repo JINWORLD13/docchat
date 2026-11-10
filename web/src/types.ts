@@ -81,12 +81,15 @@ export interface MetricsResponse {
     timedOut: number;
     rejected: number;
   };
-  breaker: { open: boolean; consecutiveFailures: number; reopensInMs: number };
+  // probing: 쿨다운은 지났고 복구를 확인하는 시험 요청 하나가 나가 있는 구간.
+  // open과 따로 받는 이유는 이때도 나머지 요청은 계속 막히기 때문이다 —
+  // open만 보면 화면이 "정상"이라고 말해버린다(server/breaker.ts).
+  breaker: { open: boolean; consecutiveFailures: number; reopensInMs: number; probing: boolean };
   // 임베딩 전용 회로. 생성과 나눠 둔 이유는 server/breaker.ts에 있다 —
   // 생성이 죽으면 출처만 돌려줄 수 있지만, 임베딩이 죽으면 검색조차 못 한다.
-  embedBreaker: { open: boolean; consecutiveFailures: number; reopensInMs: number };
+  embedBreaker: { open: boolean; consecutiveFailures: number; reopensInMs: number; probing: boolean };
   // 로컬 생성(Ollama) 회로. GENERATORS 체인에 ollama가 없으면 늘 닫혀 있다.
-  localBreaker: { open: boolean; consecutiveFailures: number; reopensInMs: number };
+  localBreaker: { open: boolean; consecutiveFailures: number; reopensInMs: number; probing: boolean };
   realtime: { rooms: number; users: number; messagesRejected: number };
   faults: { llmFail: boolean };
 }

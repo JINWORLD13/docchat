@@ -180,6 +180,12 @@ export default function Dashboard() {
   const lb = m?.localBreaker;
   const rt = m?.realtime;
 
+  // 회로 셋 중 하나라도 열렸나 / 복구를 확인하는 중인가.
+  // 두 상태를 나눠 두는 이유: 열림은 위험(빨강)이지만 반열림은 회복 중이라
+  // 색은 다르되 "조용함"으로 보여선 안 된다.
+  const anyOpen = (br?.open ?? false) || (eb?.open ?? false) || (lb?.open ?? false);
+  const anyProbing = (br?.probing ?? false) || (eb?.probing ?? false) || (lb?.probing ?? false);
+
   return (
     <div className="dash">
       <div className="dash-head">
@@ -251,24 +257,32 @@ export default function Dashboard() {
           // 예전엔 생성만 감싸고 있어서, 임베딩 API가 죽으면 회로가 영영 안 열린 채
           // 요청마다 재시도를 다 소진하고 실패했다. 화면에도 "닫힘"으로만 보였다.
           sub="외부 API·로컬 모델 장애 자동 차단 (임베딩 · 생성 · 로컬)"
-          active={(br?.open ?? false) || (eb?.open ?? false) || (lb?.open ?? false)}
-          danger={(br?.open ?? false) || (eb?.open ?? false) || (lb?.open ?? false)}
+          // 반열림도 "발동 중"으로 센다. 그 구간에는 시험 한 건만 통과하고
+          // 나머지는 계속 막히므로, 화면이 조용하면 실제와 다른 말을 하는 셈이다.
+          active={anyOpen || anyProbing}
+          danger={anyOpen}
           stat={
             (br?.open
               ? `생성 열림 · ${Math.ceil(br.reopensInMs / 1000)}s 후 재시도`
-              : `생성 닫힘 · 연속실패 ${br?.consecutiveFailures ?? 0}`) +
+              : br?.probing
+                ? `생성 반열림 · 복구 확인 중(시험 1건만 통과)`
+                : `생성 닫힘 · 연속실패 ${br?.consecutiveFailures ?? 0}`) +
             (eb?.open
               ? ` · 임베딩 열림 · ${Math.ceil(eb.reopensInMs / 1000)}s`
-              : (eb?.consecutiveFailures ?? 0) > 0
-                ? ` · 임베딩 실패 ${eb?.consecutiveFailures}`
-                : "") +
+              : eb?.probing
+                ? ` · 임베딩 반열림`
+                : (eb?.consecutiveFailures ?? 0) > 0
+                  ? ` · 임베딩 실패 ${eb?.consecutiveFailures}`
+                  : "") +
             // 로컬 회로는 체인에 ollama를 넣었을 때만 움직인다. 깨끗할 때는
             // 표시하지 않는다 — 안 쓰는 기능의 지표로 줄을 채울 이유가 없다.
             (lb?.open
               ? ` · 로컬 열림(보루로 폴백) · ${Math.ceil(lb.reopensInMs / 1000)}s`
-              : (lb?.consecutiveFailures ?? 0) > 0
-                ? ` · 로컬 실패 ${lb?.consecutiveFailures}`
-                : "")
+              : lb?.probing
+                ? ` · 로컬 반열림`
+                : (lb?.consecutiveFailures ?? 0) > 0
+                  ? ` · 로컬 실패 ${lb?.consecutiveFailures}`
+                  : "")
           }
         />
       </div>
@@ -281,7 +295,11 @@ export default function Dashboard() {
           warn={(m?.readPool.waiting ?? 0) > 0}
         />
         <Metric label="처리 중 / 상한" value={ad ? `${ad.inFlight} / ${ad.maxInFlight}` : "-"} />
-        <Metric label="회로 상태" value={br?.open ? "열림" : "닫힘"} warn={br?.open} />
+        <Metric
+          label="회로 상태"
+          value={br?.open ? "열림" : br?.probing ? "반열림" : "닫힘"}
+          warn={br?.open || br?.probing}
+        />
         <Metric
           label="실시간 채팅 접속"
           value={rt ? `${rt.rooms}방 · ${rt.users}명` : "-"}

@@ -28,22 +28,44 @@ type StreamFn = (
   image?: QuestionImage
 ) => Promise<AsyncIterable<AnswerChunk>> | AsyncIterable<AnswerChunk>;
 
-function breakered(name: string, circuit: Breaker, open: StreamFn): AnswerGenerator {
+// 테스트에서 가짜 회로·가짜 스트림을 끼워 판정 규칙을 검사한다
+// (이 파일 머리말의 "회로 판정 시점이 미묘하다"가 정확히 테스트할 가치가 있는 부분).
+export function breakered(name: string, circuit: Breaker, open: StreamFn): AnswerGenerator {
   return {
     async *stream(question, contexts, signal, image): AsyncIterable<AnswerChunk> {
       // 최근 연속 장애면 부르지도 않는다. 받는 쪽(폴백 체인 또는 코어)이
       // 이걸 다음 공급자 시도 또는 degrade로 바꾼다.
       if (circuit.isOpen()) throw new DependencyUnavailableError(name);
 
+      // 이 요청이 반열림 시험권을 들고 있을 수 있다(위 isOpen이 소비한다).
+      // 성공·실패 어느 쪽으로도 판정하지 못한 채 끝나면 아래 finally가 반납한다.
+      let settled = false;
       try {
         const stream = await open(question, contexts, signal, image);
         for await (const chunk of stream) {
           yield chunk;
         }
-        if (!signal.aborted) circuit.onSuccess();
+        if (!signal.aborted) {
+          circuit.onSuccess();
+          settled = true;
+        }
       } catch (e) {
-        if (!signal.aborted) circuit.onFailure();
+        if (!signal.aborted) {
+          circuit.onFailure();
+          settled = true;
+        }
         throw e;
+      } finally {
+        // 코어가 중간에 for-await를 빠져나가면(사용자 이탈, 카카오의 5초 예산
+        // 초과) 이 제너레이터는 yield 지점에서 닫힌다 — catch도 성공 처리도
+        // 타지 않는다. 그 덕에 "떠난 사용자를 실패로 세지 않는다"는 규칙이
+        // 자동으로 지켜지지만, 시험권까지 같이 사라진다.
+        //
+        // 그러면 회로가 쿨다운이 끝나도 영원히 열린 채 남는다. 게다가 state()는
+        // 쿨다운만 보므로 화면에는 "닫힘"이 뜬다 — 모든 질문이 degrade로
+        // 떨어지는데 대시보드는 정상이라고 말하는 상태다. 재시작 외에 복구가
+        // 없었다. finally가 필요한 이유가 여기 있다(breaker.ts의 onAbandoned).
+        if (!settled) circuit.onAbandoned();
       }
     },
   };
